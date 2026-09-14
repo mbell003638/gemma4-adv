@@ -1,0 +1,71 @@
+name: Standalone Gemma lab acceptance
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    # Local lab refs only; this workflow is not a publication path.
+    if: ${{ github.ref_name == 'codex/manus-gemma4-p0-p3' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: ['default', 'gemma']
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Synthetic APK acceptance regressions
+        run: python3 -B scripts/on-device-ai/test-standalone-apk.py
+      - name: Fetch engine using the existing Needle asset
+        run: |
+          test -s scripts/on-device-ai/needle2-ledgr.cact
+          python3 -m pip install --user cactus-needle
+          export PATH="$HOME/.local/bin:$PATH"
+          node scripts/on-device-ai/fetch-native.mjs
+      - name: Generate Android without clean
+        run: node node_modules/expo/bin/cli prebuild --platform android --no-install
+      - name: Build standalone test-signed variant
+        working-directory: frontend/android
+        env:
+          GEMMA_ENABLED: ${{ matrix.runtime == 'gemma' && 'true' || 'false' }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease "-PledgrGemmaEnabled=$GEMMA_ENABLED" -PreactNativeArchitectures=arm64-v8a -PledgrRequireNeedle=true -Pandroid.enableMinifyInReleaseBuilds=false -Pandroid.enableShrinkResourcesInReleaseBuilds=false --init-script ../scripts/on-device-ai/audit-testsigning.init.gradle --no-daemon --no-configuration-cache
+      - name: Inspect actual packaged ELF, ZIP, metadata and JavaScript
+        env:
+          RUNTIME: ${{ matrix.runtime }}
+        run: |
+          mkdir -p ../artifacts/standalone
+          cp android/app/build/outputs/apk/release/app-release.apk "../artifacts/standalone/$RUNTIME-arm64-standalone-testsigned.apk"
+          python3 scripts/on-device-ai/verify-standalone-apk.py \
+            --apk "../artifacts/standalone/$RUNTIME-arm64-standalone-testsigned.apk" \
+            --runtime "$RUNTIME" --package com.ahem.ledgrai --min-sdk 24 --target-sdk 36 \
+            --needle-reference scripts/on-device-ai/needle2-ledgr.cact \
+            --zipalign "$ANDROID_HOME/build-tools/36.0.0/zipalign" \
+            --aapt2 "$ANDROID_HOME/build-tools/36.0.0/aapt2" \
+            > "../artifacts/standalone/$RUNTIME-verification.json"
+      - name: Upload inspected standalone artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: standalone-testsigned-${{ matrix.runtime }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/standalone/*
+          if-no-files-found: error
+          retention-days: 7

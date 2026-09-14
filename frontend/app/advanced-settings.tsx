@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { View, Text, StyleSheet, TextInput, Pressable, ScrollView, ActivityIndicator, KeyboardAvoidingView, Platform, Alert } from "react-native";
+import { View, Text, StyleSheet, TextInput, Pressable, ScrollView, ActivityIndicator, KeyboardAvoidingView, Platform, Alert, Linking } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
@@ -20,6 +20,8 @@ import { getAICapabilities } from "@/src/db/aiCapabilities";
 import { getDeviceSpeechStatus } from "@/src/utils/deviceSpeechRecognizer";
 import { getLocalOcrStatus } from "@/src/utils/localOcr";
 import { cancelOptionalOnDeviceModelDownload, deleteOptionalOnDeviceModel, downloadOptionalOnDeviceModel, getOnDeviceLlmStatus, getPreferredOnDevicePack, listOptionalOnDeviceModels, resolveOnDevicePacks, setPreferredOnDevicePack } from "@/src/utils/onDeviceLlm";
+import { bundledGemmaPacks } from "@/src/accountingV2/gemma/packCatalogV2";
+import { discardGemmaPartial, downloadGemmaPack, gemmaPackStatus, pauseGemmaDownload, removeGemmaPack, recoverGemmaRuntime } from "@/src/utils/gemmaNative";
 
 const AccordionRow = ({ title, subtitle, isLast, expandedKey, setExpandedKey, children, theme }: any) => {
   const isExpanded = expandedKey === title;
@@ -146,6 +148,17 @@ export default function AdvancedSettingsScreen() {
   const [preferredModel, setPreferredModel] = useState<string | null>(null);
   const [phoneRamGb, setPhoneRamGb] = useState<string>("");
   const installedPackBytes = optionalModels.reduce((total, model) => total + (model.installed ? (model.bytesOnDisk || model.bytes || 0) : 0), 0);
+  const gemmaCatalog = useMemo(() => bundledGemmaPacks(), []);
+  const [gemmaStatus, setGemmaStatus] = useState<Awaited<ReturnType<typeof gemmaPackStatus>> | null>(null);
+  const [gemmaBusy, setGemmaBusy] = useState<string | null>(null);
+  useEffect(() => {
+    if (!gemmaStatus?.managementOperation && !Object.values(gemmaStatus?.packs || {}).some(pack => pack.state === 'verifying')) return;
+    let active = true;
+    const timer = setInterval(() => {
+      void gemmaPackStatus().then(status => { if (active) setGemmaStatus(status); }).catch(() => undefined);
+    }, 1500);
+    return () => { active = false; clearInterval(timer); };
+  }, [gemmaStatus]);
   const params = useLocalSearchParams<{ section?: string }>();
 
   const chooseProvider = (nextProvider: ProviderId) => {
@@ -207,6 +220,7 @@ export default function AdvancedSettingsScreen() {
       setPhoneRamGb(needle?.totalRamBytes ? ((needle.totalRamBytes) / (1024 ** 3)).toFixed(1) : "");
       setNeedleStatus(needle?.needleAvailable ? "Needle 2 is ready on this phone." : (needle?.reason || "Needle ships in the native APK after the Cactus engine is vendored."));
       setOptionalModels(models);
+      setGemmaStatus(await gemmaPackStatus().catch(() => null));
       setBaseUrl(cfg.baseUrl || "");
       setAiDataMode(s.aiDataMode === 'detailed' ? 'detailed' : 'summary');
       setAiRememberHistory(s.aiRememberHistory === true);
@@ -805,6 +819,24 @@ export default function AdvancedSettingsScreen() {
               </AccordionRow>
               <AccordionRow title="On-device models" subtitle="Needle, Gemma downloads, speak answers" theme={theme} expandedKey={expandedKey} setExpandedKey={setExpandedKey}>
                 <Text style={styles.hint}>{needleStatus}</Text>
+                <Text style={[styles.label, { marginTop: theme.spacing.md }]}>Gemma 4 · LiteRT-LM (experimental)</Text>
+                <Text style={styles.hint} testID="gemma-runtime-status">{gemmaStatus?.supported ? `This build currently exposes: ${gemmaStatus.capabilities.join(", ") || "no verified modalities"}. Vision and audio stay unavailable until device validation passes.` : "Gemma downloads require a compatible native build. Needle and the current models remain unchanged."}</Text>
+                {gemmaStatus?.managementOperation ? <Text style={styles.hint}>Local model operation: {gemmaStatus.managementOperation}. Verification does not download the model again.</Text> : null}
+                {gemmaStatus?.recoveryRequired ? <Pressable onPress={async () => { try { await recoverGemmaRuntime(); } catch { setDownloadHint("Restart the app to recover the local model safely."); } finally { setGemmaStatus(await gemmaPackStatus().catch(() => null)); } }}><Text style={styles.hint}>Recover local model (an app restart may be required)</Text></Pressable> : null}
+                {gemmaCatalog.map((pack) => {
+                  const installed = gemmaStatus?.packs[pack.id]; const state = installed?.state || "not-installed"; const busy = gemmaBusy === pack.id;
+                  return <View key={pack.id} style={{ marginTop: theme.spacing.sm }} testID={`gemma-pack-${pack.id}`}>
+                    <Text style={styles.label}>{pack.label}</Text>
+                    <Text style={styles.hint}>{gbLabel(pack.bytes)} GB · Apache 2.0 · model stays on this phone. State: {state}.{installed?.partialBytes ? ` Partial: ${gbLabel(installed.partialBytes)} GB.` : ""}</Text>
+                    <Pressable onPress={() => void Linking.openURL("https://www.apache.org/licenses/LICENSE-2.0")}><Text style={[styles.hint, { color: theme.color.brandPrimary }]}>View Apache 2.0 license</Text></Pressable>
+                    <View style={styles.modeRow}>
+                      {Boolean(installed?.bytesOnDisk) ? <Pressable disabled={busy || state === "verifying" || Boolean(gemmaStatus?.managementOperation)} testID={`gemma-remove-${pack.id}`} onPress={() => Alert.alert("Remove downloaded model?", `This removes ${pack.label} from this phone.`, [{ text: "Cancel", style: "cancel" }, { text: "Remove", style: "destructive", onPress: async () => { setGemmaBusy(pack.id); try { await removeGemmaPack(pack.id); setGemmaStatus(await gemmaPackStatus()); } catch (error: any) { setDownloadHint(error?.message || "Model removal failed."); } finally { setGemmaStatus(await gemmaPackStatus().catch(() => null)); setGemmaBusy(null); } } }])} style={[styles.addBtn, { marginTop: 6 }]}><Text style={styles.addText}>{busy ? "Working…" : "Remove model"}</Text></Pressable>
+                        : <Pressable disabled={busy || !gemmaStatus?.supported || Boolean(gemmaStatus?.managementOperation)} testID={`gemma-download-${pack.id}`} onPress={async () => { setGemmaBusy(pack.id); try { await downloadGemmaPack(pack.id); } catch (error: any) { setDownloadHint(error?.message || "Gemma download stopped."); } finally { setGemmaStatus(await gemmaPackStatus().catch(() => null)); setGemmaBusy(null); } }} style={[styles.addBtn, { marginTop: 6, opacity: gemmaStatus?.supported ? 1 : 0.5 }]}><Text style={styles.addText}>{busy ? "Downloading…" : installed?.partialBytes ? "Resume" : "Download"}</Text></Pressable>}
+                      {busy ? <Pressable testID={`gemma-pause-${pack.id}`} onPress={() => void pauseGemmaDownload(pack.id)} style={[styles.addBtn, { marginTop: 6 }]}><Text style={styles.addText}>Pause</Text></Pressable> : null}
+                      {!busy && Boolean(installed?.partialBytes) ? <Pressable testID={`gemma-discard-${pack.id}`} onPress={async () => { try { await discardGemmaPartial(pack.id); } catch (error: any) { setDownloadHint(error?.message || "Could not remove partial model."); } finally { setGemmaStatus(await gemmaPackStatus().catch(() => null)); } }} style={[styles.addBtn, { marginTop: 6 }]}><Text style={styles.addText}>Remove partial</Text></Pressable> : null}
+                    </View>
+                  </View>;
+                })}
                 <View style={styles.modeRow}>
                   <Pressable
                     testID="speak-answers-toggle"

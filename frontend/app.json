@@ -75,6 +75,7 @@
         }
       ],
       "expo-sqlite",
+      "./plugins/withGemmaAndroidToolchain",
       "./plugins/withAndroidAssistant",
       "./plugins/withBlockedAndroidPermissions"
     ],

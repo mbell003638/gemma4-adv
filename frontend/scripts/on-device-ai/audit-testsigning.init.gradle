@@ -1,0 +1,19 @@
+// Audit-only init script, explicitly passed by the standalone drivers.
+// finalizeDsl runs before AGP creates variants; projectsEvaluated is too late.
+gradle.beforeProject { project ->
+    project.plugins.withId('com.android.application') {
+        project.extensions.getByName('androidComponents').finalizeDsl { android ->
+            def debugSigning = android.signingConfigs.findByName('debug')
+            if (debugSigning == null || debugSigning.storeFile == null ||
+                debugSigning.storeFile.canonicalFile != new File(project.projectDir, 'debug.keystore').canonicalFile ||
+                debugSigning.keyAlias != 'androiddebugkey' ||
+                debugSigning.storePassword != 'android' || debugSigning.keyPassword != 'android') {
+                throw new GradleException('Audit build requires the local Android debug keystore')
+            }
+            android.buildTypes.getByName('release').signingConfig = debugSigning
+            android.buildTypes.getByName('release').minifyEnabled = false
+            android.buildTypes.getByName('release').shrinkResources = false
+            android.packaging.jniLibs.useLegacyPackaging = false
+        }
+    }
+}

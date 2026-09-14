@@ -34,4 +34,13 @@ The store APK is whoever runs that native build (you locally, or EAS in the clou
 
 ## Optional Gemma packs
 
-Convert with `cactus download` and place `.cact` files in the app's `on-device-models/optional/` folder, or use Advanced Settings → Download (needs a hosted `.cact` URL).
+This isolated lab uses the pinned Gemma 4 `.litertlm` catalog and LiteRT-LM
+bridge. Advanced Settings downloads approved packs by model ID; native code
+checks the pinned size/hash before installation. Do not convert these packs
+to `.cact` or replace Needle's trained `needle2.cact` asset.
+
+For the standalone default/Gemma build driver and artifact checks, read
+`../../../audit-fix-handoff/FINAL-IMPLEMENTATION-HANDOFF.md` and the dated
+A05/A12 build handoff. The owner has deferred all execution for the current
+implementation pass. A Metro-dependent debug APK or external JS export is
+not a standalone acceptance artifact.

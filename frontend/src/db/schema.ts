@@ -18,7 +18,7 @@ export const COLLECTIONS = [
   'locations', 'posSessions', 'stockTransfers',
 ] as const;
 export type CollectionName = typeof COLLECTIONS[number];
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 export const V2_TABLES = [
   'v2_books', 'v2_personas', 'v2_parties', 'v2_accounts', 'v2_periods', 'v2_sources',
@@ -37,6 +37,23 @@ export function schemaSql(): string {
     CREATE TABLE IF NOT EXISTS ${c} (id TEXT PRIMARY KEY, date TEXT, data TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_${c}_date ON ${c}(date);`).join('\n');
   return `${documents}
+    CREATE TABLE IF NOT EXISTS assistant_proposals (
+      id TEXT PRIMARY KEY,
+      book_id TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      normalized_json TEXT NOT NULL,
+      scope_json TEXT NOT NULL,
+      entity_versions_json TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending','applied','cancelled','expired')),
+      result_json TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(book_id, request_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_assistant_proposals_book_state ON assistant_proposals(book_id, state, created_at);
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 

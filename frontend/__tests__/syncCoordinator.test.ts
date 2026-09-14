@@ -1,4 +1,48 @@
+import { withSyncedMutationLocked , completeSyncRecovery, disableSync, enableSync, getSyncStatus, markSyncRecoveryRequired, retrySyncNow, syncNow, withSyncedMutation } from '../src/sync/coordinator';
+import { withSyncDatabaseMutationLock } from '../src/sync/databaseMutex';
+
+import { initSchema } from '../src/db/schema';
+import { makeNodeRunner } from './helpers/nodeRunner';
+import { makeSyncOperation, enqueueSyncOperation } from '../src/sync/outbox';
+import { hashPayload } from '../src/sync/protocol';
+
+import { enrollSyncDevice, publishServerSnapshot } from '../src/sync/recovery';
 const asyncMem: Record<string, string> = {};
+
+test('assistant-held transaction can capture sync intent without reacquiring the lock', async () => {
+  const { runner, close } = await setup();
+  try {
+    await runner.run("INSERT OR REPLACE INTO meta(key,value) VALUES('v2_active_book_id',?)", [bookId]);
+    await withSyncDatabaseMutationLock(async () => {
+      await runner.exec('SAVEPOINT assistant_test');
+      await withSyncedMutationLocked(runner, {
+        commandType: 'party.patch', aggregateType: 'party', aggregateId: 'assistant-party',
+        payload: { id: 'assistant-party', patch: { phone: '123' } },
+      }, async () => {
+        await runner.run("INSERT INTO meta(key,value) VALUES('assistant-effect','yes')");
+        return { id: 'assistant-party' };
+      }, bookId);
+      expect(await runner.all("SELECT * FROM sync_outbox WHERE aggregate_id='assistant-party'")).toHaveLength(1);
+      await runner.exec('ROLLBACK TO SAVEPOINT assistant_test');
+      await runner.exec('RELEASE SAVEPOINT assistant_test');
+    });
+    expect(await runner.all("SELECT * FROM sync_outbox WHERE aggregate_id='assistant-party'")).toHaveLength(0);
+    expect(await runner.first("SELECT * FROM meta WHERE key='assistant-effect'")).toBeFalsy();
+  } finally { close(); }
+}, 15000);
+
+test('assistant sync adapter rejects a changed active book before any write', async () => {
+  const { runner, close } = await setup();
+  try {
+    const apply = jest.fn(async () => 'must not run');
+    await runner.run("INSERT OR REPLACE INTO meta(key,value) VALUES('v2_active_book_id',?)", [bookId]);
+    await expect(withSyncDatabaseMutationLock(() => withSyncedMutationLocked(runner, {
+      commandType: 'party.patch', aggregateId: 'assistant-party', payload: {},
+    }, apply, 'different-book'))).rejects.toThrow('Active book changed');
+    expect(apply).not.toHaveBeenCalled();
+    expect(await runner.all('SELECT * FROM sync_outbox')).toHaveLength(0);
+  } finally { close(); }
+});
 const secureMem: Record<string, string> = {};
 
 jest.mock('@react-native-async-storage/async-storage', () => ({
@@ -25,13 +69,6 @@ jest.mock('expo-auth-session', () => ({
   refreshAsync: jest.fn(),
   AuthRequest: jest.fn(),
 }));
-
-import { initSchema } from '../src/db/schema';
-import { makeNodeRunner } from './helpers/nodeRunner';
-import { makeSyncOperation, enqueueSyncOperation } from '../src/sync/outbox';
-import { hashPayload } from '../src/sync/protocol';
-import { completeSyncRecovery, disableSync, enableSync, getSyncStatus, markSyncRecoveryRequired, retrySyncNow, syncNow, withSyncedMutation } from '../src/sync/coordinator';
-import { enrollSyncDevice, publishServerSnapshot } from '../src/sync/recovery';
 
 const bookId = 'book-coordinator';
 const epoch = 'epoch-coordinator';

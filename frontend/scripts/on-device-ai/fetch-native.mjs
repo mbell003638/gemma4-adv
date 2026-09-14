@@ -13,7 +13,10 @@ const staging = path.join(androidMain, 'needle-native');
 fs.mkdirSync(staging, { recursive: true });
 
 function runNeedle(args) {
-  const result = spawnSync('needle', args, { stdio: 'inherit', shell: true });
+  // Keep arguments as an argv array. `shell: true` breaks Windows workspace
+  // paths containing spaces (for example "Ledger AI Codex") into separate
+  // command-line arguments.
+  const result = spawnSync('needle', args, { stdio: 'inherit', shell: false });
   if (result.status !== 0) {
     throw new Error(`needle ${args.join(' ')} failed. Install with: pip install cactus-needle`);
   }

@@ -191,9 +191,16 @@ export async function getSyncStatus(db: SqlRunner, bookId: string): Promise<Sync
 }
 
 export async function withSyncedMutation<T>(db: SqlRunner, mutation: SyncMutation, apply: () => Promise<T>): Promise<T> {
-  return withSyncDatabaseMutationLock(async () => {
+  return withSyncDatabaseMutationLock(() => withSyncedMutationLocked(db, mutation, apply));
+}
+
+/** Caller must already hold the sync database lock, and use the same runner for
+ * its surrounding savepoint and domain write. Never call the public locking API
+ * from a proposal transaction: the database lock is deliberately non-reentrant. */
+export async function withSyncedMutationLocked<T>(db: SqlRunner, mutation: SyncMutation, apply: () => Promise<T>, expectedBookId?: string): Promise<T> {
     const context = await db.first<any>("SELECT value FROM meta WHERE key='v2_active_book_id'");
     const bookId = String(context?.value || '');
+    if (expectedBookId !== undefined && bookId !== expectedBookId) throw new Error('Active book changed before assistant mutation');
     const profile = bookId ? await getSyncProfile(db, bookId) : null;
     if (!profile?.bookEpoch || (profile.recoveryRequired && profile.recoveryReason === FIRST_DEVICE_BOOTSTRAP_REASON)) return apply();
     const state = (await readSyncBookState(db, bookId)) || { bookId, bookEpoch: profile.bookEpoch, serverCursor: 0, updatedAt: now() };
@@ -218,7 +225,6 @@ export async function withSyncedMutation<T>(db: SqlRunner, mutation: SyncMutatio
         : { value: original.payload, _result: result };
       return { ...original, payload: capturedPayload, payloadHash: hashPayload(capturedPayload) };
     }, profile.recoveryRequired ? 'quarantined' : 'pending');
-  });
 }
 
 class SyncHttpError extends Error { constructor(readonly status: number, message: string) { super(message); } }

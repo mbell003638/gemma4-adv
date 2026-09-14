@@ -15,6 +15,7 @@ import { OnboardingGateProvider, useOnboardingGate } from "@/src/context/Onboard
 import { initStorage } from "@/src/db/backend";
 import { requireAuth } from "@/src/utils/lock";
 import { scheduleBackgroundLock } from "@/src/utils/systemPrompt";
+import { setAssistantSessionState } from "@/src/utils/assistantSessionState";
 import { api } from "@/src/api";
 import { isCapabilityEnabled, type CapabilityKey } from "@/src/utils/capabilities";
 import { SyncStatusIndicator } from "@/src/components/SyncStatusIndicator";
@@ -300,6 +301,11 @@ export default function RootLayout() {
   const [unlocking, setUnlocking] = useState(false);
   const shouldUnlockOnActive = React.useRef(false);
   const backgroundLockTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setAssistantSessionState({ storageReady, unlocked });
+    return () => setAssistantSessionState({ storageReady: false, unlocked: false });
+  }, [storageReady, unlocked]);
 
   const attemptUnlock = React.useCallback(async () => {
     if (Platform.OS === "web") {

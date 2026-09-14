@@ -1,0 +1,8 @@
+{
+  "product": "Manus on-device",
+  "sourceBranch": "Manus-on-device-ai",
+  "baselineCommit": "5b00321e6a90e9016d59c0179bec16cdc6a7a33c",
+  "experimentBranch": "codex/manus-gemma4-p0-p3",
+  "needlePath": "frontend/scripts/on-device-ai/needle2-ledgr.cact",
+  "needleSha256": "24982abc3ed97b36192a16b0ea2758698c1a300853c01ab69e9decb3852d140f"
+}

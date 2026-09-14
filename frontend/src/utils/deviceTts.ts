@@ -7,6 +7,8 @@ type NativeTts = {
   isAvailable?: () => Promise<boolean> | boolean;
   speak?: (text: string) => Promise<void> | void;
   stop?: () => Promise<void> | void;
+  setLocale?: (languageTag: string) => Promise<boolean> | boolean;
+  openVoiceDataInstaller?: () => Promise<void> | void;
 };
 
 function nativeModule(): NativeTts | null {
@@ -44,10 +46,20 @@ export async function speakOnDevice(text: string): Promise<void> {
   if (!spoken) return;
   const module = nativeModule();
   if (!module?.speak) return;
-  await module.speak(spoken.slice(0, 600));
+  await module.speak(spoken);
 }
 
 export async function stopOnDeviceSpeech(): Promise<void> {
   const module = nativeModule();
   if (module?.stop) await module.stop();
+}
+
+export async function setDeviceTtsLocale(languageTag: string): Promise<boolean> {
+  const module = nativeModule();
+  return module?.setLocale ? Boolean(await module.setLocale(languageTag)) : false;
+}
+
+export async function openDeviceTtsVoiceInstaller(): Promise<void> {
+  const module = nativeModule();
+  if (module?.openVoiceDataInstaller) await module.openVoiceDataInstaller();
 }

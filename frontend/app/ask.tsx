@@ -11,7 +11,11 @@ import { useTheme } from "@/src/context/ThemeContext";
 import { api, getAIConfig } from "@/src/api";
 import { getCurrencySymbol } from "@/src/utils/currency";
 import { executeAssistantProposal, validateAssistantProposal, type AssistantProposalValidationResult } from "@/src/accountingV2/aiActions";
+import { createAssistantActionExecutor } from "@/src/accountingV2/gemma/assistantActionExecutor";
+import { cancelLiveProposal, confirmLiveProposal, type DurableProposalPreview } from "@/src/accountingV2/gemma/liveProposalController";
 import { localTodayIso } from "@/src/utils/dateValidation";
+import { handlePendingConfirmation, requestIsCurrent } from "@/src/accountingV2/gemma/confirmationIntent";
+import { captureAssistantScope, assistantScopeIsCurrent } from "@/src/accountingV2/gemma/liveProposalController";
 import { getDataVersion } from "@/src/utils/dataVersion";
 import * as ImagePicker from "expo-image-picker";
 import { confirmAction, showAlert } from "@/src/utils/alerts";
@@ -28,8 +32,7 @@ type PendingClarification =
   | { kind: "provider"; originalRequest: string; question: string };
 
 // Source tag prefixed onto notes/memo of records this screen creates (fix M-5).
-const AI_TAG = "[AI]";
-const tagNote = (note?: string) => `${AI_TAG} ${note || ""}`.trim();
+const tagNote = (note?: string) => `[AI] ${note || ""}`.trim();
 
 /**
  * Sanitize a single field of untrusted OCR text before it is interpolated into
@@ -78,270 +81,10 @@ function paymentActionFromCommand(command: VoiceCommand): { type: string; params
 
 type ValidatedProposal = Extract<AssistantProposalValidationResult, { ok: true }>;
 
-function requireExactMatch<T extends { id: string; name?: string }>(rows: T[], name: unknown, label: string): T {
-  const requested = String(name || "").trim().toLocaleLowerCase();
-  const exact = rows.filter((row) => String(row.name || "").trim().toLocaleLowerCase() === requested);
-  if (exact.length !== 1) {
-    throw new Error(exact.length > 1
-      ? `More than one ${label} is named "${String(name)}". Choose the exact entry in Ledgr first.`
-      : `${label} "${String(name)}" was not found. Add it first or use its exact Ledgr name.`);
-  }
-  return exact[0];
-}
 
-function requireEntry<T extends { id: string }>(rows: T[], id: unknown, label: string): T {
-  const found = rows.find((row) => row.id === String(id || ""));
-  if (!found) throw new Error(`${label} was not found. Refresh Ask AI and try again.`);
-  return found;
-}
 
-function mergeAmount(current: any, changes: any) {
-  if (changes.amount === undefined) return { ...current, ...changes };
-  const amount = Number(changes.amount);
-  const next = { ...current, ...changes, amount, total: amount };
-  if (Array.isArray(current.lines)) {
-    if (current.lines.length > 1 && changes.lines === undefined) {
-      throw new Error("This document has multiple lines. Tell me which line to change.");
-    }
-    if (current.lines.length === 1 && changes.lines === undefined) {
-      const qty = Number(current.lines[0].qty ?? current.lines[0].quantity ?? 1) || 1;
-      next.lines = [{ ...current.lines[0], qty, rate: amount / qty }];
-    }
-  }
-  return next;
-}
 
-async function applyAction(action: { type: string; params: any }): Promise<string> {
-  const today = localTodayIso();
-  const p = action.params || {};
-  switch (action.type) {
-    case "add_expense":
-      await api.createExpense({ category: p.category || "General", amount: p.amount, date: p.date || today, method: p.method || "cash", notes: tagNote(p.notes) });
-      return "Expense recorded ✓";
-    case "log_personal_expense":
-      await api.createExpense({ category: p.category || "Personal", amount: p.amount, date: p.date || today, method: p.method || "cash", notes: tagNote(p.notes || "Personal expense") });
-      return `Personal expense of $${Number(p.amount).toFixed(2)} recorded ✓`;
-    case "add_sale":
-      await api.createSale({ amount: p.amount, date: p.date || today, paymentType: p.paymentType || "cash", method: p.method || "cash", notes: tagNote(p.notes) });
-      return "Sale recorded ✓";
-    case "add_bill": {
-      const supplier = requireExactMatch(await api.listSuppliers(), p.supplierName, "Supplier");
-      await api.createBill({ supplierId: supplier.id, supplierName: supplier.name, amount: p.amount, date: p.date || today, paymentType: p.paymentType || "cash", method: p.method || "cash", notes: tagNote(p.notes) });
-      return "Purchase recorded ✓";
-    }
-    case "add_debtor":
-      await api.findOrCreateParty(p.name, "customer", { phone: p.phone || "" });
-      return `Customer "${p.name}" added ✓`;
-    case "add_supplier":
-      await api.findOrCreateParty(p.name, "supplier", { phone: p.phone || "" });
-      return `Supplier "${p.name}" added ✓`;
-    case "add_debtor_payment": {
-      const customer = requireExactMatch(await api.listDebtors(), p.name, "Customer");
-      await api.createReceipt({ mode: "advance", debtorId: customer.id, clientName: customer.name, amount: p.amount, date: p.date || today, method: p.method || "cash", notes: tagNote(p.notes || "customer advance") });
-      return `Payment received from "${customer.name}" ✓`;
-    }
-    case "create_supplier_payment": {
-      const supplier = requireExactMatch(await api.listSuppliers(), p.supplierName, "Supplier");
-      await api.createPayment({ type: "supplier_payment", supplierId: supplier.id, supplierName: supplier.name, amount: p.amount, date: p.date || today, method: p.method || "cash", notes: tagNote(p.notes) });
-      return `Payment to "${supplier.name}" recorded ✓`;
-    }
-    case "create_invoice": {
-      const customer = requireExactMatch(await api.listDebtors(), p.clientName, "Customer");
-      const amt = Number(p.amount);
-      await api.createInvoice({ partyId: customer.id, debtorId: customer.id, clientName: customer.name, lines: [{ description: p.notes || "Service", qty: 1, rate: amt }], taxRate: 0, total: amt, date: p.date || today, notes: tagNote(p.notes) });
-      return `Invoice for "${customer.name}" created ✓`;
-    }
-    case "create_receipt": {
-      const amt = Number(p.amount);
-      const mode = p.mode || (p.customerName ? "advance" : "cash_sale");
-      let debtorId: string | null = null;
-      let clientName = "";
-      let allocations: { invoiceId: string; amountApplied: number }[] = [];
-      if (mode !== "cash_sale") {
-        const customer = requireExactMatch(await api.listDebtors(), p.customerName, "Customer");
-        debtorId = customer.id;
-        clientName = customer.name || "";
-        if (mode === "against_invoice") {
-          const invoices = (await api.listInvoices()).filter((item: any) => item.status !== "paid" && item.id === String(p.invoiceId || ""));
-          if (invoices.length !== 1) throw new Error("Choose the exact unpaid invoice before applying this receipt.");
-          allocations = [{ invoiceId: invoices[0].id, amountApplied: amt }];
-        }
-      }
-      await api.createReceipt({ mode, amount: amt, date: p.date || today, method: p.method || "cash", debtorId, clientName, allocations, notes: tagNote(p.notes) });
-      return `Receipt for ${amt.toFixed(2)} recorded ✓`;
-    }
-    case "create_quote": {
-      const customer = requireExactMatch(await api.listDebtors(), p.clientName, "Customer");
-      const amt = Number(p.amount);
-      await api.createQuote({ partyId: customer.id, debtorId: customer.id, clientName: customer.name, lines: [{ description: p.notes || "Service", qty: 1, rate: amt }], taxRate: 0, total: amt, date: p.date || today, notes: tagNote(p.notes) });
-      return `Quote for "${customer.name}" created ✓`;
-    }
-    case "create_drawing": {
-      const member = requireExactMatch(await api.listInvestors(), p.partnerName, "Capital Account");
-      await api.drawInvestorFunds(member.id, { amount: Number(p.amount), date: p.date || today, notes: tagNote(p.notes) });
-      return `Withdrawal for "${member.name}" recorded ✓`;
-    }
-    case "add_capital": {
-      const member = requireExactMatch(await api.listInvestors(), p.partnerName, "Capital Account");
-      await api.depositInvestorCapital(member.id, { amount: Number(p.amount), date: p.date || today, notes: tagNote(p.notes) });
-      return `Capital for "${member.name}" added ✓`;
-    }
-    case "record_inventory":
-      await api.recordV2InventoryCount({ date: p.date || today, value: Number(p.amount), notes: tagNote(p.notes) });
-      return "Inventory count recorded ✓";
-    case "create_marketplace_order":
-      await api.createMarketplaceOrder({ platform: p.platform, externalOrderId: p.externalOrderId, date: p.date || today, status: p.status, gross: p.gross, tax: p.tax, marketplaceFee: p.marketplaceFee, shippingFee: p.shippingFee, refund: p.refund, rtoFee: p.rtoFee, currency: p.currency, exchangeRate: p.exchangeRate, settlementId: p.settlementId, notes: tagNote(p.notes) });
-      return `Marketplace order ${p.externalOrderId} recorded ✓`;
-    case "record_marketplace_refund":
-      await api.recordMarketplaceRefund({ orderId: p.orderId, date: p.date || today, amount: p.amount, notes: tagNote(p.notes) });
-      return "Marketplace refund recorded ✓";
-    case "record_marketplace_rto":
-      await api.recordMarketplaceRto({ orderId: p.orderId, date: p.date || today, fee: p.fee, notes: tagNote(p.notes) });
-      return "Marketplace RTO recorded ✓";
-    case "create_marketplace_settlement":
-      await api.createMarketplaceSettlement({ platform: p.platform, settlementId: p.settlementId, date: p.date || today, payout: p.payout, currency: p.currency, exchangeRate: p.exchangeRate, settlementAccountCode: p.settlementAccountCode, notes: tagNote(p.notes) });
-      return `Marketplace settlement ${p.settlementId} recorded ✓`;
-    case "create_project":
-      await api.createProject({ name: p.name, partyId: p.partyId, budget: p.budget, currency: p.currency, metadata: { source: "ai" } });
-      return `Project "${p.name}" created ✓`;
-    case "add_project_time":
-      await api.addProjectTime({ projectId: p.projectId, date: p.date || today, hours: p.hours, rate: p.rate, description: tagNote(p.description || p.notes) });
-      return "Project time recorded ✓";
-    case "record_project_cost":
-      await api.recordProjectCost({ projectId: p.projectId, date: p.date || today, amount: p.amount, description: tagNote(p.description || p.notes), accountCode: p.accountCode, method: p.method || "cash" });
-      return "Project cost recorded ✓";
-    case "create_creator_contract":
-      await api.createCreatorContract({ brand: p.brand, campaign: p.campaign, agreedAmount: p.agreedAmount, partyId: p.partyId, currency: p.currency, dueDate: p.dueDate, metadata: { source: "ai" } });
-      return `Creator contract for ${p.brand} created ✓`;
-    case "record_creator_payout":
-      await api.recordCreatorPayout({ contractId: p.contractId, date: p.date || today, amount: p.amount, currency: p.currency, method: p.method || "bank", notes: tagNote(p.notes) });
-      return "Creator payout recorded ✓";
-    case "create_bom":
-      await api.createBom({ productId: p.productId, name: p.name, version: p.version, metadata: { source: "ai" } });
-      return `BOM "${p.name}" created ✓`;
-    case "add_bom_line":
-      await api.addBomLine({ bomId: p.bomId, componentProductId: p.componentProductId, quantity: p.quantity, unitCost: p.unitCost, metadata: { source: "ai" } });
-      return "BOM component added ✓";
-    case "create_production_order":
-      await api.createProductionOrder({ bomId: p.bomId, date: p.date || today, quantity: p.quantity, status: p.status || "completed", notes: tagNote(p.notes) });
-      return "Production order recorded ✓";
-    case "create_trade_shipment":
-      await api.createTradeShipment({ reference: p.reference, date: p.date || today, direction: p.direction || "import", supplierId: p.supplierId, customerId: p.customerId, currency: p.currency, exchangeRate: p.exchangeRate, goodsValue: p.goodsValue, notes: tagNote(p.notes) });
-      return `Trade shipment ${p.reference} created ✓`;
-    case "add_trade_landed_cost":
-      await api.addTradeLandedCost({ shipmentId: p.shipmentId, date: p.date || today, kind: p.kind, amount: p.amount, currency: p.currency, exchangeRate: p.exchangeRate, capitalized: p.capitalized !== false, method: p.method || "cash", notes: tagNote(p.notes) });
-      return "Trade landed cost recorded ✓";
-    case "record_fx_remeasurement":
-      await api.recordFxRemeasurement({ date: p.date || today, accountCode: p.accountCode, amount: p.amount, gainLoss: p.gainLoss, currency: p.currency, exchangeRate: p.exchangeRate, reference: p.reference, notes: tagNote(p.notes) });
-      return `FX ${p.gainLoss} recorded ✓`;
-    case "update_entry": {
-      const changes = p.changes || {};
-      switch (p.entity) {
-        case "expense": {
-          const current = requireEntry(await api.listExpenses(), p.id, "Expense");
-          await api.updateExpense(current.id, mergeAmount(current, changes));
-          break;
-        }
-        case "sale": {
-          const current = requireEntry((await api.listSales()).filter((row: any) => row.type !== "invoice"), p.id, "Sale");
-          await api.updateSale(current.id, mergeAmount(current, changes));
-          break;
-        }
-        case "bill": {
-          const current = requireEntry(await api.listBills(), p.id, "Bill");
-          await api.updateBill(current.id, mergeAmount(current, changes));
-          break;
-        }
-        case "supplier_payment": {
-          const current = requireEntry((await api.listPayments()).filter((row: any) => row.type === "supplier_payment"), p.id, "Supplier payment");
-          await api.updatePayment(current.id, mergeAmount(current, changes));
-          break;
-        }
-        case "receipt": {
-          const current = requireEntry(await api.listReceipts(), p.id, "Receipt");
-          await api.updateReceipt(current.id, mergeAmount(current, changes));
-          break;
-        }
-        case "invoice": {
-          const current = requireEntry(await api.listInvoices(), p.id, "Invoice");
-          await api.updateInvoice(current.id, mergeAmount(current, changes));
-          break;
-        }
-        case "quote": {
-          const current = requireEntry(await api.listQuotes(), p.id, "Quote");
-          await api.updateQuote(current.id, mergeAmount(current, changes));
-          break;
-        }
-        case "customer": {
-          const current = requireEntry(await api.listDebtors(), p.id, "Customer");
-          await api.updateDebtor(current.id, { ...current, ...changes });
-          break;
-        }
-        case "supplier": {
-          const current = requireEntry(await api.listSuppliers(), p.id, "Supplier");
-          await api.updateSupplier(current.id, { ...current, ...changes });
-          break;
-        }
-        case "delivery_note": {
-          const current = requireEntry(await api.listDeliveryNotes(), p.id, "Delivery note");
-          await api.updateDeliveryNote(current.id, { ...current, ...changes });
-          break;
-        }
-        case "note":
-          await api.updateNote(String(p.id), changes);
-          break;
-        case "capital": {
-          const memberId = String(p.memberId || "");
-          if (!memberId) throw new Error("The Capital Account is missing. Ask again using the partner name.");
-          const ledger = await api.getInvestorLedger(memberId);
-          const current = requireEntry(ledger.transactions.filter((row: any) => row.type === "capital_injection"), p.id, "Capital entry");
-          await api.updateInvestorCapital(memberId, current.id, { amount: Number(changes.amount ?? current.amount), date: changes.date || current.date, notes: tagNote(changes.notes ?? current.notes) });
-          break;
-        }
-        case "drawing": {
-          const current = requireEntry((await api.listPayments()).filter((row: any) => row.type === "drawing"), p.id, "Withdrawal");
-          await api.updatePayment(current.id, mergeAmount(current, changes));
-          break;
-        }
-        case "cash_entry": {
-          const current = requireEntry((await api.listCashEntries()).filter((row: any) => row.editable), p.id, "Cash Book entry");
-          await api.updateCashEntry(current.id, mergeAmount(current, changes));
-          break;
-        }
-        case "inventory_count":
-          throw new Error("Inventory counts are audit records. Reverse this count, then record a corrected count.");
-        default:
-          throw new Error("That entry type cannot be edited from Ask AI.");
-      }
-      return "Entry updated ✓";
-    }
-    case "delete_entry":
-      switch (p.entity) {
-        case "expense": await api.deleteExpense(String(p.id)); break;
-        case "sale": await api.deleteSale(String(p.id)); break;
-        case "bill": await api.deleteBill(String(p.id)); break;
-        case "supplier_payment":
-        case "drawing": await api.deletePayment(String(p.id)); break;
-        case "receipt": await api.deleteReceipt(String(p.id)); break;
-        case "invoice": await api.deleteInvoice(String(p.id)); break;
-        case "quote": await api.deleteQuote(String(p.id)); break;
-        case "delivery_note": await api.deleteDeliveryNote(String(p.id)); break;
-        case "note": await api.deleteNote(String(p.id)); break;
-        case "inventory_count": throw new Error("Inventory counts are audit records. Reverse this count, then record a corrected count.");
-        case "cash_entry": await api.deleteCashEntry(String(p.id)); break;
-        case "capital": {
-          const memberId = String(p.memberId || "");
-          if (!memberId) throw new Error("The Capital Account is missing. Ask again using the partner name.");
-          await api.deleteInvestorCapital(memberId, String(p.id));
-          break;
-        }
-        default: throw new Error("That entry type cannot be reversed or deleted from Ask AI.");
-      }
-      return ["quote", "delivery_note"].includes(String(p.entity)) ? "Entry deleted ✓" : "Entry safely reversed ✓";
-    default:
-      throw new Error("Unknown action — no changes made.");
-  }
-}
+const applyAction = createAssistantActionExecutor(api);
 
 const SUGGESTIONS = [
   "What was my profit this month?",
@@ -369,18 +112,50 @@ export default function AskBooks() {
   // synchronously on every change, so it is always the text on screen.
   const inputRef = useRef("");
   const updateInput = useCallback((value: string) => { inputRef.current = value; setInput(value); }, []);
-  const clearInput = useCallback(() => { inputRef.current = ""; clearInput(); }, []);
+  const clearInput = useCallback(() => { inputRef.current = ""; setInput(""); }, []);
   const params = useLocalSearchParams<{ text?: string }>();
   useEffect(() => { if (typeof params.text === "string" && params.text.trim()) updateInput(params.text.trim()); }, [params.text, updateInput]);
   const [loading, setLoading] = useState(false);
   const [applyingProposal, setApplyingProposal] = useState(false);
   const applyingProposalRef = useRef(false);
+  const requestSequence = useRef(0);
+  const screenMounted = useRef(true);
+  const heldRequestScope = useRef<Awaited<ReturnType<typeof captureAssistantScope>> | null>(null);
+  useEffect(() => {
+    screenMounted.current = true;
+    return () => { screenMounted.current = false; requestSequence.current += 1; };
+  }, []);
   const [pendingProposal, setPendingProposal] = useState<ValidatedProposal | null>(null);
+  const [pendingDurableProposal, setPendingDurableProposal] = useState<DurableProposalPreview | null>(null);
   const [pendingClarification, setPendingClarification] = useState<PendingClarification | null>(null);
+  useEffect(() => {
+    let active = true;
+    let checking = false;
+    const timer = setInterval(() => {
+      const scope = heldRequestScope.current;
+      const token = requestSequence.current;
+      if (!scope || checking || applyingProposalRef.current) return;
+      checking = true;
+      void assistantScopeIsCurrent(scope).then((current) => {
+        if (!active || current || token !== requestSequence.current) return;
+        requestSequence.current += 1;
+        heldRequestScope.current = null;
+        setPendingProposal(null);
+        setPendingDurableProposal(null);
+        setPendingClarification(null);
+        setLoading(false);
+      }).finally(() => { checking = false; });
+    }, 500);
+    return () => { active = false; clearInterval(timer); };
+  }, []);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const [aiDataMode, setAiDataMode] = useState<'summary' | 'detailed'>('summary');
   const [rememberHistory, setRememberHistory] = useState(false);
+  useEffect(() => {
+    const id = pendingDurableProposal?.id;
+    return () => { if (id) void cancelLiveProposal(id).catch(() => undefined); };
+  }, [pendingDurableProposal?.id]);
 
 
   useFocusEffect(useCallback(() => {
@@ -390,6 +165,7 @@ export default function AskBooks() {
       setMessages([]);
       setPendingClarification(null);
       setPendingProposal(null);
+      setPendingDurableProposal(null);
       setHistoryKey(nextKey);
     }
     return undefined;
@@ -466,12 +242,19 @@ export default function AskBooks() {
     + (keyboardVisible ? 0 : insets.bottom);
 
   const clearHistory = () => {
+    if (applyingProposalRef.current) return;
     confirmAction(
       "Clear Ask AI history?",
       "This clears the saved conversation for this business book only. It does not change any accounting entries.",
       async () => {
+        if (applyingProposalRef.current || !screenMounted.current) return;
+        const token = ++requestSequence.current;
         try {
           await AsyncStorage.removeItem(historyKey);
+          if (!screenMounted.current || token !== requestSequence.current) return;
+          heldRequestScope.current = null;
+          setPendingDurableProposal(null);
+          setLoading(false);
           setMessages([]);
           setPendingClarification(null);
           setPendingProposal(null);
@@ -498,9 +281,14 @@ export default function AskBooks() {
   const applyPendingProposal = async () => {
     const proposal = pendingProposal;
     if (!proposal || applyingProposalRef.current) return;
+    const token = requestSequence.current;
+    const scope = heldRequestScope.current;
+    const isCurrent = (afterWrite = false) => requestIsCurrent(token, () => requestSequence.current,
+      () => scope ? assistantScopeIsCurrent(scope, afterWrite) : Promise.resolve(false));
     applyingProposalRef.current = true;
     setApplyingProposal(true);
     try {
+      if (!await isCurrent()) return;
       const workflow = await api.createWorkflowDraft({
         actionType: proposal.action.type,
         idempotencyKey: `ai:${proposal.action.type}:${JSON.stringify(proposal.action.params)}`,
@@ -512,8 +300,10 @@ export default function AskBooks() {
       if (workflow.status === "posted") {
         result = "That exact AI action was already applied earlier; I did not create a duplicate.";
       } else {
+        if (!await isCurrent(true)) return;
         await api.approveWorkflow(workflow.id, "user");
         try {
+          if (!await isCurrent(true)) return;
           if (proposal.action.type === "create_supplier_payment" && proposal.action.params?.supplierName) {
             await materializePendingVoiceParty({
               intent: "supplier_payment",
@@ -524,25 +314,61 @@ export default function AskBooks() {
               customer: (name) => api.createDebtor({ name }),
             });
           }
-          result = await executeAssistantProposal(proposal, { confirmed: true }, () => applyAction(proposal.action));
+          result = await executeAssistantProposal(proposal, { confirmed: true }, async () => {
+        if (!await isCurrent(true)) throw new Error('The book context changed. Prepare a new proposal.');
+        return applyAction(proposal.action);
+      });
+          if (!await isCurrent(true)) return;
           await api.markWorkflowPosted(workflow.id, undefined, "system");
         } catch (error: any) {
+          if (!await isCurrent(true)) return;
           await api.markWorkflowFailed(workflow.id, error?.message || "AI action failed", "system");
           throw error;
         }
       }
+      if (!await isCurrent(true)) return;
       setPendingProposal(null);
       commitMessages((m) => [...m, { role: "assistant", text: String(result) }]);
     } catch (err: any) {
+      if (!await isCurrent(true)) return;
       commitMessages((m) => [...m, { role: "assistant", text: `I couldn't apply that change: ${err?.message || "error"}` }]);
     } finally {
       applyingProposalRef.current = false;
-      setApplyingProposal(false);
-      setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
+      if (screenMounted.current) setApplyingProposal(false);
+      setTimeout(() => {
+        if (screenMounted.current && token === requestSequence.current) scrollRef.current?.scrollToEnd({ animated: true });
+      }, 100);
+    }
+  };
+
+  const applyPendingDurableProposal = async () => {
+    const proposal = pendingDurableProposal;
+    if (!proposal || applyingProposalRef.current) return;
+    const token = requestSequence.current;
+    const scope = heldRequestScope.current;
+    const isCurrent = (afterWrite = false) => requestIsCurrent(token, () => requestSequence.current,
+      () => scope ? assistantScopeIsCurrent(scope, afterWrite) : Promise.resolve(false));
+    applyingProposalRef.current = true;
+    setApplyingProposal(true);
+    try {
+      if (!await isCurrent()) return;
+      const outcome = await confirmLiveProposal(proposal.id);
+      if (!await isCurrent(true)) return;
+      if (outcome.kind !== 'applied') throw new Error(outcome.code.replace(/_/g, ' ').toLowerCase());
+      setPendingDurableProposal(null);
+      commitMessages((m) => [...m, { role: "assistant", text: outcome.replayed ? "That change was already recorded." : "Ledgr change recorded ✓" }]);
+    } catch (err: any) {
+      if (!await isCurrent(true)) return;
+      commitMessages((m) => [...m, { role: "assistant", text: `I couldn't apply that change: ${err?.message || "error"}` }]);
+    } finally {
+      applyingProposalRef.current = false;
+      if (screenMounted.current) setApplyingProposal(false);
     }
   };
 
   const cancelPendingProposal = (includeUserMessage = false) => {
+    if (applyingProposalRef.current || !screenMounted.current) return;
+    requestSequence.current += 1;
     setPendingProposal(null);
     commitMessages((m) => [
       ...m,
@@ -551,36 +377,62 @@ export default function AskBooks() {
     ]);
   };
 
+  const cancelPendingDurableProposal = async (includeUserMessage = false) => {
+    if (applyingProposalRef.current || !screenMounted.current) return;
+    const token = ++requestSequence.current;
+    const scope = heldRequestScope.current;
+    const proposal = pendingDurableProposal;
+    setPendingDurableProposal(null);
+    if (proposal) await cancelLiveProposal(proposal.id).catch(() => undefined);
+    if (!await requestIsCurrent(token, () => requestSequence.current,
+      () => scope ? assistantScopeIsCurrent(scope) : Promise.resolve(false))) return;
+    commitMessages((m) => [...m, ...(includeUserMessage ? [{ role: "user" as const, text: "Cancel" }] : []), { role: "assistant", text: "Okay — I did not change your books." }]);
+  };
+
   const send = async (text: string) => {
     const q = text.trim();
-    if (!q || loading || applyingProposal) return;
-    if (pendingProposal && /^(yes\b|y$|i confirm\b|confirm\b|apply\b|proceed\b|ok(?:ay)?\b|please (?:apply|record|enter|save)\b)/i.test(q)) {
-      clearInput();
-      commitMessages((m) => [...m, { role: "user", text: q }]);
-      await applyPendingProposal();
-      return;
-    }
-    if (pendingProposal && /^(no\b|n$|cancel\b|stop\b|discard\b|never ?mind\b)/i.test(q)) {
-      clearInput();
-      cancelPendingProposal(true);
+    if (!q || loading || applyingProposalRef.current) return;
+    const requestToken = ++requestSequence.current;
+    const requestScope = await captureAssistantScope().catch(() => null);
+    if (!requestScope || requestToken !== requestSequence.current) return;
+    if (!pendingProposal && !pendingDurableProposal) heldRequestScope.current = requestScope;
+    const isCurrent = () => requestIsCurrent(requestToken, () => requestSequence.current, () => assistantScopeIsCurrent(requestScope));
+
+    if (pendingDurableProposal || pendingProposal) {
+      await handlePendingConfirmation(q, {
+        confirm: async () => {
+          if (!await isCurrent()) return;
+          clearInput();
+          commitMessages((m) => [...m, { role: "user", text: q }]);
+          if (pendingDurableProposal) await applyPendingDurableProposal();
+          else await applyPendingProposal();
+        },
+        cancel: async () => {
+          if (!await isCurrent()) return;
+          clearInput();
+          if (pendingDurableProposal) await cancelPendingDurableProposal(true);
+          else cancelPendingProposal(true);
+        },
+        clarify: async () => {
+          if (!await isCurrent()) return;
+          commitMessages((m) => [...m, { role: "assistant", text: "Nothing was applied. Cancel this proposal before revising it, or use Apply to record exactly the displayed change." }]);
+        },
+      });
       return;
     }
 
-    const priorProposal = pendingProposal;
     const clarification = pendingClarification;
     const originalRequest = clarification?.originalRequest || q;
     const skipLocalPartyResolution = clarification?.kind === "party" && /\b(?:expense|refund|another|other|none|no)\b/i.test(q);
-    const localPaymentCommand = priorProposal || skipLocalPartyResolution
+    const localPaymentCommand = skipLocalPartyResolution
       ? null
       : clarification?.kind === "party"
         ? clarification.command
         : parseSimpleOutgoingPayment(q);
-    const questionForAi = priorProposal
-      ? `The user is revising this pending Ledgr transaction entry. Existing action JSON: ${JSON.stringify(priorProposal.action)}. User follow-up: ${q}. Return the full revised action, or ask one counter-question.`
-      : clarification
+    const questionForAi = clarification
         ? `Continue this one pending Ledgr transaction request without losing its details.\nOriginal user request: ${clarification.originalRequest}\nAssistant counter-question: ${clarification.question}\nUser answer: ${q}\nUse the original amount, date, and party together with the user's answer. Return the complete action, or ask exactly one remaining counter-question.`
         : q;
-    if (priorProposal) setPendingProposal(null);
+    if (!await isCurrent()) return;
     if (clarification) setPendingClarification(null);
     clearInput();
     commitMessages((m) => [...m, { role: "user", text: q }]);
@@ -593,6 +445,7 @@ export default function AskBooks() {
           api.listDebtors(),
           api.listInvestors(),
         ]);
+        if (!await isCurrent()) return;
         // The question offers "Create a Supplier (recommended) or a Customer",
         // but resolveVoicePartyCommand reacts only to those literal words, so
         // "Yes", "I confirm" or "create it" fell through and re-asked the same
@@ -644,9 +497,22 @@ export default function AskBooks() {
       }
 
       const context = await buildContext();
+      if (!await isCurrent()) return;
       const res: any = await api.askBooks(questionForAi, context);
+      if (!await isCurrent()) {
+        if (res?.durableProposal?.id) await cancelLiveProposal(res.durableProposal.id).catch(() => undefined);
+        return;
+      }
       const answer = typeof res === "string" ? res : res?.answer || "";
       const action = typeof res === "string" ? null : res?.action || null;
+      const durableProposal = typeof res === "string" ? null : res?.durableProposal || null;
+      if (durableProposal?.id && durableProposal?.preview) {
+        setPendingDurableProposal(durableProposal);
+        setPendingProposal(null);
+        setPendingClarification(null);
+        if (answer) commitMessages((m) => [...m, { role: "assistant", text: answer }]);
+        return;
+      }
       if (action && action.type) {
         const proposal = validateAssistantProposal(action, "ai");
         if (!proposal.ok) {
@@ -658,7 +524,7 @@ export default function AskBooks() {
           setPendingClarification(null);
           if (answer) {
             commitMessages((m) => [...m, { role: "assistant", text: answer }]);
-            void api.getSpeakAnswers().then((enabled) => { if (enabled) return speakOnDevice(answer); }).catch(() => undefined);
+            void api.getSpeakAnswers().then(async (enabled) => { if (enabled && await isCurrent()) return speakOnDevice(answer); }).catch(() => undefined);
           }
         }
       } else if (answer) {
@@ -668,27 +534,36 @@ export default function AskBooks() {
           setPendingClarification(null);
         }
         commitMessages((m) => [...m, { role: "assistant", text: answer }]);
-        void api.getSpeakAnswers().then((enabled) => { if (enabled) return speakOnDevice(answer); }).catch(() => undefined);
+        void api.getSpeakAnswers().then(async (enabled) => { if (enabled && await isCurrent()) return speakOnDevice(answer); }).catch(() => undefined);
       }
     } catch (e: any) {
+      if (!await isCurrent()) return;
       if (clarification) setPendingClarification(clarification);
       commitMessages((m) => [...m, { role: "assistant", text: `Sorry, I couldn't answer that. ${e?.message || "Check your AI key in Settings."}` }]);
     } finally {
-      setLoading(false);
+      if (requestToken === requestSequence.current) setLoading(false);
       setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
     }
   };
 
   const handleImagePicked = async (asset: { uri?: string; base64?: string | null }, sourceLabel: "Camera" | "Library") => {
+    if (loading || applyingProposalRef.current || pendingProposal || pendingDurableProposal) return;
+    const requestToken = ++requestSequence.current;
+    const requestScope = await captureAssistantScope().catch(() => null);
+    if (!requestScope || requestToken !== requestSequence.current) return;
+    heldRequestScope.current = requestScope;
+    const isCurrent = () => requestIsCurrent(requestToken, () => requestSequence.current, () => assistantScopeIsCurrent(requestScope));
     try {
       if (!asset?.base64 && !asset?.uri) {
         throw new Error(sourceLabel === "Camera" ? "The camera did not return readable image data. Try taking the photo again." : "The selected file did not contain readable image data. Try a JPEG or PNG image.");
       }
       setLoading(true);
       const config = await getAIConfig();
+      if (!await isCurrent()) return;
 
       if (config.apiKey && asset.base64) {
         const ocr = await api.ocrReceipt(asset.base64, "image/jpeg");
+        if (!await isCurrent()) return;
         const prompt = buildReceiptPrompt(ocr);
         await send(prompt);
         return;
@@ -699,11 +574,13 @@ export default function AskBooks() {
       try {
         analysis = await api.analyzeDocument(input);
       } catch {
+        if (!await isCurrent()) return;
         setPendingScanInput(input);
         router.push({ pathname: "/scan-import", params: { imageUri: asset.uri } } as any);
         return;
       }
 
+      if (!await isCurrent()) return;
       const mapped = mapAnalyzedDocument(analysis);
       const hasClarification = Boolean(analysis?.__ledgrAnalysisMeta?.pending);
       const hasFlagged = Boolean(mapped.flaggedRows && mapped.flaggedRows.length > 0);
@@ -737,6 +614,7 @@ export default function AskBooks() {
         return;
       }
 
+      if (!await isCurrent()) return;
       setPendingProposal(proposal);
       setPendingClarification(null);
       const today = localTodayIso();
@@ -748,9 +626,10 @@ export default function AskBooks() {
       ]);
       setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
     } catch (e: any) {
+      if (!await isCurrent()) return;
       Alert.alert(`${sourceLabel} Error`, e.message || `Failed to process ${sourceLabel.toLowerCase()} image`);
     } finally {
-      setLoading(false);
+      if (requestToken === requestSequence.current) setLoading(false);
     }
   };
 
@@ -806,6 +685,22 @@ export default function AskBooks() {
             </View>
           ))}
 
+          {pendingDurableProposal && (
+            <View testID="ask-durable-proposal-card" style={[styles.proposalCard, pendingDurableProposal.destructive && styles.proposalCardDestructive]}>
+              <View style={styles.proposalHeader}>
+                <Ionicons name={pendingDurableProposal.destructive ? "warning-outline" : "checkmark-circle-outline"} size={20} color={pendingDurableProposal.destructive ? theme.color.error : theme.color.brandPrimary} />
+                <Text style={styles.proposalTitle}>{pendingDurableProposal.destructive ? "Review reversal" : "Review Gemma change"}</Text>
+              </View>
+              <Text style={styles.proposalPreview}>{pendingDurableProposal.preview}</Text>
+              <Text style={styles.proposalHint}>Stored locally. Only this proposal ID can be confirmed.</Text>
+              <View style={styles.proposalButtons}>
+                <Pressable testID="ask-durable-proposal-cancel" disabled={applyingProposal} onPress={() => void cancelPendingDurableProposal()} style={styles.proposalCancel}><Text style={styles.proposalCancelText}>Cancel</Text></Pressable>
+                <Pressable testID="ask-durable-proposal-apply" disabled={applyingProposal} onPress={applyPendingDurableProposal} style={[styles.proposalApply, applyingProposal && { opacity: 0.6 }]}>
+                  {applyingProposal ? <ActivityIndicator size="small" color="#fff" /> : <Text style={styles.proposalApplyText}>Apply</Text>}
+                </Pressable>
+              </View>
+            </View>
+          )}
           {pendingProposal && (
             <View testID="ask-pending-action-card" style={[styles.proposalCard, pendingProposal.action.isDestructive && styles.proposalCardDestructive]}>
               <View style={styles.proposalHeader}>

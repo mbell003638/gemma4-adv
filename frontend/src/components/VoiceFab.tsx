@@ -21,6 +21,7 @@ import { captureVoiceRecording, cancelVoiceRecorder, friendlyVoiceError, startVo
 import { subscribeToVoiceAssistantRequest } from "@/src/utils/voiceAssistantRequest";
 import { DeviceSpeechSession, getDeviceSpeechBridge, isDeviceSpeechAvailable } from "@/src/utils/deviceSpeechRecognizer";
 import { speakOnDevice } from "@/src/utils/deviceTts";
+import { gemmaPackStatus, hasReadyGemmaCapability } from "@/src/utils/gemmaNative";
 
 type Phase = "idle" | "recording" | "processing" | "confirm" | "error";
 
@@ -118,8 +119,8 @@ export default function VoiceFab({ showFab = true }: { showFab?: boolean } = {})
       const voiceMode = effectiveVoiceProvider(config);
       const bridge = getDeviceSpeechBridge();
       const available = bridge ? await isDeviceSpeechAvailable(bridge) : false;
-      if (voiceMode === "android-device" || (voiceMode !== "cloud" && available)) {
-        if (!bridge || !available) throw new Error("Android device speech recognition is unavailable on this device.");
+      if (available && voiceMode !== "cloud") {
+        if (!bridge) throw new Error("Android device speech recognition is unavailable on this device.");
         deviceSession.current = new DeviceSpeechSession(bridge, { onDeviceOnly: isOnDeviceInterpretation(config) });
         setPhase("recording");
         deviceSession.current.promise.then(async (txt) => {
@@ -128,6 +129,10 @@ export default function VoiceFab({ showFab = true }: { showFab?: boolean } = {})
           setDrafts(ready); setParsed(ready[0]?.parsed || null); setValidatedAction(ready[0]?.validation || null); setPhase("confirm");
         }).catch((e: any) => { deviceSession.current = null; if (e?.code !== "CANCELLED") { setError(e?.message || "Device voice input failed."); setPhase("error"); } });
         return;
+      }
+      if (voiceMode === "android-device") {
+        const gemma = await gemmaPackStatus();
+        if (!hasReadyGemmaCapability(gemma, 'audio')) throw new Error("Android device speech recognition and Gemma audio are unavailable on this device.");
       }
       if (!config.apiKey.trim()) {
         setError("Android speech was unavailable and no AI key is configured. Type the transaction below, then update the draft.");

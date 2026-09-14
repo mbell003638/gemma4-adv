@@ -75,6 +75,10 @@ agenthub/agents/youtube/db
 *.deb
 *.dylib
 
+# Local Gemma audit/build outputs; source and scripts remain tracked
+/artifacts/
+/.local-tools/
+
 # Build caches
 .cache/
 
@@ -108,5 +112,8 @@ test_result.md
 .agents/
 memory/
 *.ps1
+!frontend/scripts/on-device-ai/build-standalone.ps1
 backend/
 *.keystore
+.local-tools/
+spikes/gemma4/build/

@@ -1,4 +1,8 @@
 const runOptionalOnDeviceModel = jest.fn();
+// This suite exercises legacy prose only; Gemma availability is a separate boundary.
+jest.mock('../src/accountingV2/gemma/liveGemmaAsk', () => ({
+  askWithLiveGemma: jest.fn(async () => null),
+}));
 
 jest.mock('../src/utils/onDeviceLlm', () => ({
   __esModule: true,

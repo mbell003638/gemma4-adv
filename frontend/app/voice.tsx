@@ -17,6 +17,7 @@ import type { LocalTransactionContinuation } from "@/src/accountingV2/localTrans
 
 import { captureVoiceRecording, cancelVoiceRecorder, friendlyVoiceError, startVoiceRecorder } from "@/src/utils/voiceRecorder";
 import { getDeviceSpeechStatus, startDeviceSpeechRecognition } from "@/src/utils/deviceSpeechRecognizer";
+import { gemmaPackStatus, hasReadyGemmaCapability } from "@/src/utils/gemmaNative";
 
 import { localTodayIso } from "@/src/utils/dateValidation";
 
@@ -81,7 +82,10 @@ export default function VoiceModal() {
           setPhase("recording");
           return;
         }
-        if (mode === "android-device") throw new Error(status.reason || "Android device speech recognition is unavailable.");
+        if (mode === "android-device") {
+          const gemma = await gemmaPackStatus();
+          if (!hasReadyGemmaCapability(gemma, 'audio')) throw new Error(status.reason || "Android device speech recognition and Gemma audio are unavailable.");
+        }
       }
       await startVoiceRecorder(recorder);
       setPhase("recording");

@@ -2,14 +2,26 @@ name: Build Ledgr AI Android
 
 on:
   workflow_dispatch:
+    inputs:
+      gemma_runtime:
+        description: 'Opt in to the downloadable Gemma lab runtime (default stays off)'
+        required: false
+        default: false
+        type: boolean
 
 
 jobs:
+  standalone:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.gemma_runtime == true && github.ref_name == 'codex/manus-gemma4-p0-p3' }}
+    uses: ./.github/workflows/gemma-standalone.yml
+    permissions:
+      contents: read
   # ---------------------------------------------------------------------------
   # Gate: the shared Play-release software checks must pass before we spend
   # ~20 min on a build. The build job below declares `needs: test`.
   # ---------------------------------------------------------------------------
   test:
+    if: ${{ !inputs.gemma_runtime }}
     name: Type-check & unit tests
     runs-on: ubuntu-latest
     defaults:
@@ -33,6 +45,8 @@ jobs:
         run: npm run qa:release
 
   build:
+    # Explicit lab-only opt-in; never enables Gemma on main/non-downloadable products.
+    if: ${{ !inputs.gemma_runtime }}
     name: Build Release APK & AAB
     needs: test
     runs-on: ubuntu-latest
@@ -180,12 +194,12 @@ jobs:
         working-directory: frontend/android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew assembleRelease -PledgrGemmaEnabled=${{ inputs.gemma_runtime == true && 'true' || 'false' }} -PreactNativeArchitectures=arm64-v8a --no-daemon
 
       - name: Build Release AAB (Play Store)
         if: steps.check.outputs.has_keystore == 'true'
         working-directory: frontend/android
-        run: ./gradlew bundleRelease --no-daemon
+        run: ./gradlew bundleRelease -PledgrGemmaEnabled=${{ inputs.gemma_runtime == true && 'true' || 'false' }} -PreactNativeArchitectures=arm64-v8a --no-daemon
 
       - name: List outputs
         run: |
