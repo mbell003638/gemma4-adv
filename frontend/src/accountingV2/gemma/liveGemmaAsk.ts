@@ -43,10 +43,10 @@ function commissionPort(db: NonNullable<ReturnType<typeof activeSqlRunner>>, sco
     const where = ids.length ? ` AND l.location_id IN (${ids.map(() => '?').join(',')})` : '';
     const row = await db.first<{ amount: number }>(
       `SELECT COALESCE(SUM(l.debit-l.credit),0) amount FROM v2_journal_lines l
-       JOIN v2_journal_entries j ON j.id=l.journal_id AND j.book_id=l.book_id
-       JOIN v2_accounts a ON a.id=l.account_id AND a.book_id=l.book_id
-       WHERE l.book_id=? AND j.date>=? AND j.date<=? AND a.code='6100'${where}`,
-      [scope.bookId, from, to, ...ids],
+       JOIN v2_journal_entries j ON j.id=l.journal_id AND j.book_id=?
+       JOIN v2_accounts a ON a.id=l.account_id AND a.book_id=?
+       WHERE j.book_id=? AND j.date>=? AND j.date<=? AND a.code='6100'${where}`,
+      [scope.bookId, scope.bookId, scope.bookId, from, to, ...ids],
     );
     return Number(row?.amount || 0);
   };
@@ -127,6 +127,7 @@ const productionDeps: LiveGemmaAskDeps = { runtime: installedGemmaRuntime, compo
 /** Runs Gemma with live, typed, scoped readers and no whole-book snapshot. */
 export async function askWithLiveGemma(question: string, allowProposals = false, deps: LiveGemmaAskDeps = productionDeps): Promise<AgentResult | null> {
   const originScope = Object.freeze({ ...await (deps.captureScope ?? captureAssistantScope)() });
+  const requestId = `ask-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   const runtime = await deps.runtime();
   if (!sameScope(originScope, await (deps.captureScope ?? captureAssistantScope)())) {
     return { kind: 'stopped', code: 'STALE_SCOPE' };
@@ -140,7 +141,7 @@ export async function askWithLiveGemma(question: string, allowProposals = false,
     tools.push(...composition.proposals.filter((tool) => proposalNames.has(tool.name)).slice(0, Math.max(0, 8 - tools.length)));
   }
   return deps.run(runtime.engine).run({
-    requestId: `ask-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    requestId,
     modelId: runtime.modelId,
     question,
     glossary: 'Sales are income; bills and supplier payments are purchases/payables; Business Accounts are member capital and drawings. Use reconciled reports; purchases are not automatically COGS.',

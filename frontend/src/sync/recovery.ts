@@ -50,13 +50,15 @@ export async function createSyncEnrollmentCode(db: SqlRunner, bookId: string, ro
 
 export async function redeemSyncEnrollmentCode(db: SqlRunner, bookId: string, code: string, displayName?: string, platform?: string): Promise<SyncEpochState> {
   const profile = await getSyncProfile(db, bookId); if (!profile) throw new Error('Configure the sync server before redeeming an enrollment code');
-  const result = await request(profile, '/v1/sync/enroll-code/redeem', { method: 'POST', body: JSON.stringify({ code, deviceId: profile.deviceId, ...(displayName ? { displayName } : {}), ...(platform ? { platform } : {}) }) });
-  const enrollment = result.enrollment;
+  const response = await request(profile, '/v1/sync/enroll-code/redeem', { method: 'POST', body: JSON.stringify({ code, deviceId: profile.deviceId, ...(displayName ? { displayName } : {}), ...(platform ? { platform } : {}) }) });
+  const enrollment = response.enrollment;
   if (!enrollment || String(enrollment.bookId) !== bookId) throw new Error('Enrollment code belongs to another Business Account');
   const epochResult = epoch(enrollment, bookId);
   const timestamp = now();
-  await db.run('UPDATE sync_profiles SET book_epoch=?,enabled=?,recovery_required=0,recovery_reason=NULL,updated_at=? WHERE id=?', [epochResult.bookEpoch, 1, timestamp, bookId]);
-  await writeSyncBookState(db, { bookId, bookEpoch: epochResult.bookEpoch, serverCursor: Math.max(0, epochResult.epochStartSequence - 1), epochNumber: epochResult.epochNumber, epochStartSequence: epochResult.epochStartSequence, updatedAt: timestamp });
+  const canonicalDataExists = epochResult.currentSequence >= epochResult.epochStartSequence;
+  const recoveryReason = canonicalDataExists ? 'Install the validated server snapshot before sync resumes' : null;
+  await db.run('UPDATE sync_profiles SET book_epoch=?,enabled=?,recovery_required=?,recovery_reason=?,updated_at=? WHERE id=?', [epochResult.bookEpoch, canonicalDataExists ? 0 : 1, canonicalDataExists ? 1 : 0, recoveryReason, timestamp, bookId]);
+  await writeSyncBookState(db, { bookId, bookEpoch: epochResult.bookEpoch, serverCursor: Math.max(0, epochResult.epochStartSequence - 1), epochNumber: epochResult.epochNumber, epochStartSequence: epochResult.epochStartSequence, updatedAt: timestamp, ...(canonicalDataExists ? {} : { snapshotHash: hashPayload([]) }) });
   return epochResult;
 }
 

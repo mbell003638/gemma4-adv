@@ -14,6 +14,7 @@ import {
 import type { VoiceCommand } from '../accountingV2/voicePartyResolution';
 import {
   DEFAULT_PACK_MANIFEST_URL,
+  ON_DEVICE_PACK_SCHEMA,
   bundledPacks,
   parsePackManifest,
   type OnDevicePack,
@@ -211,8 +212,11 @@ export async function resolveOnDevicePacks(options: { refresh?: boolean } = {}):
   try {
     const cached = await storage?.getItem(PACK_MANIFEST_CACHE_KEY);
     if (cached) {
-      const packs = JSON.parse(cached) as OnDevicePack[];
-      if (Array.isArray(packs) && packs.length) return packs;
+      const decoded = JSON.parse(cached);
+      const packs = parsePackManifest(
+        Array.isArray(decoded) ? { schema: ON_DEVICE_PACK_SCHEMA, packs: decoded } : decoded,
+      );
+      if (packs.length) return packs;
     }
   } catch { /* fall through to bundled */ }
   return bundledPacks();

@@ -1,4 +1,8 @@
 import type { SqlRunner } from '../../db/schema';
+import { round2 } from '../../money';
+import { V2BookConfigRepository } from '../bookConfigRepository';
+import { buildPersistentV2Reports } from '../persistentReports';
+import { partnershipProfitFromReports, postedCommissionFromReports } from '../reports';
 import { MAX_PAGE_ROWS } from './coreReadTools';
 import type { Obj, Scope } from './agentCore';
 import type {
@@ -7,7 +11,6 @@ import type {
 } from './coreReadTools';
 import type { BranchDeps } from './branchPorts';
 import type { ReportReadGuard } from './scopedReportReader';
-import { createScopedReportReader } from './scopedReportReader';
 
 type Json = Record<string, any>;
 type LiveKeys = 'cashMovements' | 'parties' | 'partyStatement' | 'entries' | 'entry'
@@ -38,9 +41,9 @@ function locationClause(locations: string[] | 'all', alias: string) {
 }
 function cursor(page: { size: number; after: Obj | null }): { date?: string; id?: string } {
   if (!page.after) return {};
-  const date = typeof page.after.date === 'string' ? page.after.date : undefined;
-  const id = typeof page.after.id === 'string' ? page.after.id : undefined;
-  if (!id) throw new Error('INVALID_CURSOR');
+  const date = typeof page.after.date === 'string' ? page.after.date : '';
+  const id = typeof page.after.id === 'string' ? page.after.id : '';
+  if (!date || !id) throw new Error('INVALID_CURSOR');
   return { date, id };
 }
 function page<T extends { id?: string; productId?: string; memberId?: string; date?: string }>(rows: T[], size: number): Page<T> {
@@ -82,7 +85,8 @@ async function sourceRows(db: SqlRunner, scope: Scope, locations: string[] | 'al
     [scope.bookId, ...types, ...(from ? [from] : []), ...(to ? [to] : []), ...l.params],
   );
 }
-function active(meta: Json): boolean { return meta.deleted !== true && meta.reversed !== true; }
+function flag(value: unknown): boolean { return value === true || value === 1 || value === '1'; }
+function active(meta: Json): boolean { return !flag(meta.deleted) && !flag(meta.reversed); }
 
 export function createLiveDataPorts(db: SqlRunner, guard: ReportReadGuard, scope: Scope): LivePorts {
   // The outer cursor carries book/revision only. Bind name-ordered continuation
@@ -127,27 +131,27 @@ export function createLiveDataPorts(db: SqlRunner, guard: ReportReadGuard, scope
       if (partyRoles.length !== 1) throw new Error('AMBIGUOUS_PARTY_ROLE');
       const role = partyRoles[0];
       const l = locationClause(locations, 'l');
+      const accountCodes = role === 'customer' ? ['1100', '2100'] : ['2000', '1210'];
       const rows = await db.all<any>(
-        `SELECT s.id,s.date,s.reference,s.type,
-          COALESCE(SUM(CASE WHEN a.code IN ('1100','1210') THEN l.debit ELSE 0 END),0) debit,
-          COALESCE(SUM(CASE WHEN a.code IN ('1100','2000','2100') THEN l.credit ELSE 0 END),0) credit,
-          COALESCE(SUM(CASE WHEN a.code='2000' THEN l.debit ELSE 0 END),0) ap_debit
-         FROM v2_sources s JOIN v2_journal_entries j ON j.source_id=s.id AND j.book_id=s.book_id
+        `SELECT j.id,j.date,s.reference,COALESCE(s.type,'journal') type,
+          COALESCE(SUM(l.debit),0) debit,COALESCE(SUM(l.credit),0) credit
+         FROM v2_journal_entries j LEFT JOIN v2_sources s ON j.source_id=s.id AND j.book_id=s.book_id
          JOIN v2_journal_lines l ON l.journal_id=j.id AND l.party_id=?${l.sql}
-         JOIN v2_accounts a ON a.id=l.account_id AND a.book_id=s.book_id
-         WHERE s.book_id=? AND s.date<=? GROUP BY s.id,s.date,s.reference,s.type ORDER BY s.date,s.id`,
-        [partyId, ...l.params, scope.bookId, to],
+         JOIN v2_accounts a ON a.id=l.account_id AND a.book_id=j.book_id
+         WHERE j.book_id=? AND j.date<=? AND a.code IN (?,?) GROUP BY j.id,s.type,j.date,s.reference
+         ORDER BY j.date,j.id`,
+        [partyId, ...l.params, scope.bookId, to, ...accountCodes],
       );
       let running = 0;
       const all = rows.map(row => {
-        const debit = role === 'supplier' ? Number(row.ap_debit) : Number(row.debit);
+        const debit = Number(row.debit);
         const credit = Number(row.credit);
         const delta = role === 'customer' ? debit - credit : credit - debit;
         running += delta;
         return { id: row.id, date: row.date, amount: Math.abs(delta), direction: delta >= 0 ? 'debit' as const : 'credit' as const, reference: String(row.reference || row.type) };
       });
       let opening = 0;
-      for (let i = 0; i < rows.length; i += 1) if (rows[i].date < from) opening += role === 'customer' ? Number(rows[i].debit) - Number(rows[i].credit) : Number(rows[i].credit) - Number(rows[i].ap_debit);
+      for (let i = 0; i < rows.length; i += 1) if (rows[i].date < from) opening += role === 'customer' ? Number(rows[i].debit) - Number(rows[i].credit) : Number(rows[i].credit) - Number(rows[i].debit);
       const ranged = all.filter(row => row.date >= from);
       const a = cursor(request);
       const eligible = a.date ? ranged.filter(row => row.date > a.date! || (row.date === a.date && row.id > a.id!)) : ranged;
@@ -188,7 +192,7 @@ export function createLiveDataPorts(db: SqlRunner, guard: ReportReadGuard, scope
       if (!row) return null;
       const m = json(row.metadata);
       const allocations = await db.all<any>('SELECT id,amount,invoice_source_id FROM v2_invoice_allocations WHERE book_id=? AND receipt_source_id=? ORDER BY allocated_at,id', [scope.bookId, entryId]);
-      const reversed = m.reversed === true || Boolean(await db.first('SELECT 1 FROM v2_journal_entries o JOIN v2_journal_entries r ON r.reversal_of=o.id WHERE o.book_id=? AND o.source_id=? LIMIT 1', [scope.bookId, entryId]));
+      const reversed = flag(m.reversed) || Boolean(await db.first('SELECT 1 FROM v2_journal_entries o JOIN v2_journal_entries r ON r.reversal_of=o.id WHERE o.book_id=? AND o.source_id=? LIMIT 1', [scope.bookId, entryId]));
       return { id: row.id, entity, date: row.date, amount: Number(m.total), reference: String(row.reference || ''), revision: await rev(db, scope.bookId, row.id),
         ...(m.partyId ? { partyId: String(m.partyId) } : {}), ...(row.party_name ? { partyName: row.party_name } : {}), ...(row.location_id ? { locationId: row.location_id } : {}),
         reversible: active(m) && !reversed, editable: active(m) && !reversed,
@@ -240,17 +244,29 @@ export function createLiveDataPorts(db: SqlRunner, guard: ReportReadGuard, scope
     }),
 
     businessAccounts: (from, to, request) => guarded(async () => {
+      // current_capital already includes closed-period deposits; only the open period is additive.
+      const period = await db.first<any>("SELECT start_date,end_date FROM v2_periods WHERE book_id=? AND status='open' ORDER BY start_date LIMIT 1", [scope.bookId]);
+      if (!period) throw new Error('NO_ACTIVE_PERIOD');
       const rows = await db.all<any>('SELECT id,name,current_capital,profit_share_pct FROM v2_members WHERE book_id=? ORDER BY lower(name),id', [scope.bookId]);
-      const report = await createScopedReportReader(db, guard)(scope, { from, to }, 'all');
+      const report = await buildPersistentV2Reports(db, { bookId: scope.bookId, from: period.start_date, to: period.end_date });
+      let commissionPct = 0;
+      try { commissionPct = (await new V2BookConfigRepository(db).getBookConfig(scope.bookId)).retailPartnership.commissionPct; } catch { /* optional low-level book config */ }
+      const allocatableProfit = partnershipProfitFromReports(report.profitAndLoss, commissionPct, postedCommissionFromReports(report)).netProfit;
+      const sources = await db.all<any>("SELECT id,type,metadata FROM v2_sources WHERE book_id=? AND date>=? AND date<=? AND type IN ('capital_injection','drawing') ORDER BY date DESC,id DESC", [scope.bookId, period.start_date, period.end_date]);
       const members: MemberAccount[] = [];
       for (const row of rows) {
-        const movements = await db.all<any>("SELECT type,metadata FROM v2_sources WHERE book_id=? AND date>=? AND date<=? AND type IN ('capital_injection','drawing') AND json_extract(metadata,'$.memberId')=?", [scope.bookId, from, to, row.id]);
         let injected = 0, drawings = 0;
-        for (const movement of movements) { const m = json(movement.metadata); if (!active(m)) continue; if (movement.type === 'drawing') drawings += Number(m.total || 0); else injected += Number(m.total || 0); }
+        for (const source of sources) {
+          const m = json(source.metadata);
+          const matches = m.memberId === row.id || String(m.memberName || m.partnerName || '').trim().toLowerCase() === String(row.name).trim().toLowerCase();
+          if (!active(m) || !matches) continue;
+          if (source.type === 'drawing') drawings += round2(Number(m.total || 0)); else injected += round2(Number(m.total || 0));
+        }
+        injected = round2(injected); drawings = round2(drawings);
+        const openingCapital = round2(Number(row.current_capital));
         const sharePct = row.profit_share_pct == null ? null : Number(row.profit_share_pct);
-        const capital = Number(row.current_capital) + injected - drawings
-          + (sharePct == null ? 0 : report.profitAndLoss.netProfit * sharePct / 100);
-        members.push({ memberId: row.id, name: row.name, capital, drawings, sharePct, revision: await rev(db, scope.bookId, row.id) });
+        const profitShare = sharePct == null ? 0 : round2(allocatableProfit * sharePct / 100);
+        members.push({ memberId: row.id, name: row.name, capital: round2(openingCapital + injected + profitShare - drawings), drawings, sharePct, revision: await rev(db, scope.bookId, row.id) });
       }
       return orderedPage(members, request, row => row.memberId, binding('businessAccounts', from, to));
     }),

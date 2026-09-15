@@ -1,7 +1,10 @@
 import { confirmationIntent, handlePendingConfirmation, requestIsCurrent } from '../src/accountingV2/gemma/confirmationIntent';
 
-test.each(['yes', 'YES!', 'i confirm', 'okay.', 'please apply'])('exact confirm: %s', value => {
+test.each(['yes', 'YES!', 'i confirm', 'please apply'])('exact confirm: %s', value => {
   expect(confirmationIntent(value)).toBe('confirm');
+});
+test.each(['okay.', 'y', 'ok'])('weak tokens do not confirm: %s', value => {
+  expect(confirmationIntent(value)).toBe('other');
 });
 describe.each(['durable', 'legacy'])('%s pending handler', () => {
   test.each(['yes, but make it 500 instead', 'okay cancel it', 'proceed only after I check',

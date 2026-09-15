@@ -20,6 +20,8 @@ import {
   type InstalledGemmaPack,
   type PackStatus,
 } from '../src/accountingV2/gemma/packCatalogV2';
+import * as fs from 'fs';
+import * as path from 'path';
 
 const e2b = {
   id: 'gemma4-e2b',
@@ -89,6 +91,7 @@ describe('row parsing', () => {
     ['non-https url', { downloadUrl: 'http://huggingface.co/x/resolve/main/a.litertlm' }],
     ['foreign host', { downloadUrl: 'https://example.com/x/resolve/main/a.litertlm' }],
     ['host suffix trick', { downloadUrl: 'https://huggingface.co.evil.test/a.litertlm' }],
+    ['backslash in url', { downloadUrl: 'https://huggingface.co\\evil/a.litertlm' }],
     ['credentials in url', { downloadUrl: 'https://user:pw@huggingface.co/a.litertlm' }],
     ['signed query string', { downloadUrl: 'https://huggingface.co/a.litertlm?token=abc' }],
     ['wrong runtime', { runtime: 'mediapipe' }],
@@ -116,19 +119,18 @@ describe('row parsing', () => {
 
 describe('catalogue parsing', () => {
   it('refuses a schema-1 catalogue outright', () => {
-    expect(parseGemmaCatalog({ schema: 1, packs: [e2b] })).toEqual([]);
-    expect(parseGemmaCatalog({ packs: [e2b] })).toEqual([]);
+    expect(() => parseGemmaCatalog({ schema: 1, packs: [e2b] })).toThrow('CATALOG_SCHEMA_MISMATCH');
+    expect(() => parseGemmaCatalog({ packs: [e2b] })).toThrow('CATALOG_SCHEMA_MISMATCH');
   });
 
-  it('drops duplicate ids and duplicate filenames', () => {
-    expect(parseGemmaCatalog(catalog([e2b, e2b]))).toHaveLength(1);
+  it('fails closed on duplicate ids and duplicate filenames', () => {
+    expect(() => parseGemmaCatalog(catalog([e2b, e2b]))).toThrow('CATALOG_SCHEMA_MISMATCH');
     const clash = row({ id: 'gemma4-other' });
-    expect(parseGemmaCatalog(catalog([e2b, clash]))).toHaveLength(1);
+    expect(() => parseGemmaCatalog(catalog([e2b, clash]))).toThrow('CATALOG_SCHEMA_MISMATCH');
   });
 
-  it('keeps good rows beside a bad one rather than failing the whole catalogue', () => {
-    const packs = parseGemmaCatalog(catalog([row({ sha256: 'nope' }), e2b]));
-    expect(packs.map((pack) => pack.id)).toEqual(['gemma4-e2b']);
+  it('fails closed when any row is unusable', () => {
+    expect(() => parseGemmaCatalog(catalog([row({ sha256: 'nope' }), e2b]))).toThrow('CATALOG_SCHEMA_MISMATCH');
   });
 
   it('parses cached JSON through exactly the same path', () => {
@@ -291,4 +293,19 @@ describe('legacy schema-1 downloads', () => {
     expect(isLoadableByGemmaRuntime(files[0].filename)).toBe(false);
     expect(isLoadableByGemmaRuntime(files[1].filename)).toBe(true);
   });
+});
+
+test('the native asset and the JS catalogue are the same document', () => {
+  // Two copies exist because native code must not take a model description
+  // from JS (plan 02 s3) while the UI still needs to render the same list.
+  // Drift would mean offering a model the downloader refuses, so it is a
+  // build-time failure rather than a runtime surprise.
+  const shared = path.join(__dirname, '../src/accountingV2/gemma/model-packs-v2.json');
+  const asset = path.join(
+    __dirname,
+    '../modules/ledgr-native-ai/android/src/main/assets/model-packs-v2.json',
+  );
+  expect(fs.existsSync(asset)).toBe(true);
+  const normalise = (file: string) => fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n').trim();
+  expect(normalise(asset)).toBe(normalise(shared));
 });

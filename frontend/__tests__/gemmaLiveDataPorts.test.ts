@@ -255,3 +255,114 @@ test('legacy quote and delivery-note collections are never presented as scoped V
   await expect(ports.entries('quote', '2026-01-01', '2026-12-31', null, 'all', { size: 25, after: null })).rejects.toThrow('GUIDED_SCREEN_ONLY');
   await expect(ports.entry('delivery_note', 'id', 'all')).rejects.toThrow('GUIDED_SCREEN_ONLY');
 });
+
+test('A08 dual-role is ambiguous; customer and supplier statements use role accounts and source-less journals', async () => {
+  const { repo, ports } = await setup();
+  await repo.createParty({ id: 'dual', bookId: 'a', name: 'Both Roles', roles: ['customer', 'supplier'] });
+  await expect(ports.partyStatement('dual', '2026-03-01', '2026-03-31', 'all', { size: 25, after: null })).rejects.toThrow('AMBIGUOUS_PARTY_ROLE');
+  await repo.createParty({ id: 'adv-cust', bookId: 'a', name: 'Advance Customer', roles: ['customer'] });
+  await repo.createParty({ id: 'adv-sup', bookId: 'a', name: 'Advance Supplier', roles: ['supplier'] });
+  const post = (id: string, type: string, partyId: string, lines: { accountId: string; partyId?: string; debit: number; credit: number }[]) => repo.postSourceJournal(
+    { id, bookId: 'a', type: type as any, date: '2026-03-01', metadata: { partyId } },
+    { id: id + '-j', bookId: 'a', periodId: 'a-p', date: '2026-03-01', memo: id, lines },
+  );
+  const line = (partyId: string, code: string, debit: number, credit: number) => ({ accountId: 'a:account:' + code, partyId, debit, credit });
+  await post('adv-invoice', 'invoice', 'adv-cust', [line('adv-cust', '1100', 100, 0), { accountId: 'a:account:4000', debit: 0, credit: 100 }]);
+  await post('adv-receipt', 'receipt', 'adv-cust', [
+    { accountId: 'a:account:1000', debit: 140, credit: 0 }, line('adv-cust', '1100', 0, 100), line('adv-cust', '2100', 0, 40),
+  ]);
+  await post('advance-used', 'invoice', 'adv-cust', [line('adv-cust', '2100', 15, 0), { accountId: 'a:account:4000', debit: 0, credit: 15 }]);
+  await repo.postJournal({
+    id: 'opening-ar', bookId: 'a', periodId: 'a-p', date: '2026-02-28', memo: 'opening', lines: [
+      line('adv-cust', '1100', 20, 0), { accountId: 'a:account:3000', debit: 0, credit: 20 },
+    ],
+  });
+  const customer = await ports.partyStatement('adv-cust', '2026-03-01', '2026-03-31', 'all', { size: 25, after: null });
+  expect(customer).toMatchObject({ openingBalance: 20, closingBalance: -5, role: 'customer' });
+  expect(customer?.rows).toEqual([
+    expect.objectContaining({ id: 'adv-invoice-j', amount: 100, direction: 'debit' }),
+    expect.objectContaining({ id: 'adv-receipt-j', amount: 140, direction: 'credit' }),
+    expect.objectContaining({ id: 'advance-used-j', amount: 15, direction: 'debit' }),
+  ]);
+  await post('adv-bill', 'credit_purchase', 'adv-sup', [{ accountId: 'a:account:6000', debit: 70, credit: 0 }, line('adv-sup', '2000', 0, 70)]);
+  await post('adv-pay', 'supplier_payment', 'adv-sup', [
+    line('adv-sup', '2000', 70, 0), line('adv-sup', '1210', 30, 0), { accountId: 'a:account:1000', debit: 0, credit: 100 },
+  ]);
+  const supplier = await ports.partyStatement('adv-sup', '2026-03-01', '2026-03-31', 'all', { size: 25, after: null });
+  expect(supplier).toMatchObject({ openingBalance: 0, closingBalance: -30, role: 'supplier' });
+  expect(supplier?.rows.map(row => ({ amount: row.amount, direction: row.direction }))).toEqual([
+    { amount: 70, direction: 'debit' }, { amount: 100, direction: 'credit' },
+  ]);
+  let after: Obj | null = null;
+  const ids: string[] = [];
+  do {
+    const page = await ports.partyStatement('adv-cust', '2026-02-01', '2026-03-31', 'all', { size: 1, after });
+    expect(page!.rows).toHaveLength(1);
+    ids.push(page!.rows[0].id);
+    after = page!.next;
+  } while (after !== null);
+  expect(ids).toEqual(['opening-ar', 'adv-invoice-j', 'adv-receipt-j', 'advance-used-j']);
+  expect(new Set(ids).size).toBe(4);
+});
+
+test('A09 open-period capital ignores closed-period injections and numeric reverse flags', async () => {
+  const { db, repo, ports } = await setup();
+  await db.run("UPDATE v2_periods SET end_date='2026-02-28' WHERE id='a-p'");
+  await repo.createPeriod({ id: 'current-p', bookId: 'a', startDate: '2026-03-01', endDate: '2026-03-31', status: 'open' });
+  await db.run("INSERT INTO v2_sources(id,book_id,type,date,metadata) VALUES('old-cap','a','capital_injection','2026-02-15',?)", [JSON.stringify({ memberId: 'member-a', total: 50 })]);
+  await db.run("UPDATE v2_periods SET status='closed' WHERE id='a-p'");
+  await db.run("UPDATE v2_members SET current_capital=150 WHERE id='member-a'");
+  const wide = await ports.businessAccounts('2026-01-01', '2026-12-31', { size: 25, after: null });
+  expect(wide.rows[0]).toMatchObject({ memberId: 'member-a', capital: 150, drawings: 0 });
+  await db.run("INSERT INTO v2_sources(id,book_id,type,date,metadata) VALUES('march-cap','a','capital_injection','2026-03-01',?)", [JSON.stringify({ memberId: 'member-a', total: 20 })]);
+  await db.run("INSERT INTO v2_sources(id,book_id,type,date,metadata) VALUES('march-draw','a','drawing','2026-03-31',?)", [JSON.stringify({ memberId: 'member-a', total: 10 })]);
+  expect((await ports.businessAccounts('2026-01-01', '2026-12-31', { size: 25, after: null })).rows[0]).toMatchObject({ capital: 160, drawings: 10 });
+  for (const [id, metadata] of [
+    ['numeric-reversed', { memberId: 'member-a', total: 800, reversed: 1 }],
+    ['string-deleted', { memberId: 'member-a', total: 800, deleted: '1' }],
+    ['boolean-deleted', { memberId: 'member-a', total: 800, deleted: true }],
+    ['legacy-name', { memberName: '  OWNER ', total: 0.105 }],
+    ['legacy-partner', { partnerName: 'Owner', total: 0.105 }],
+    ['future-cap', { memberId: 'member-a', total: 900 }],
+  ] as const) {
+    await db.run("INSERT INTO v2_sources(id,book_id,type,date,metadata) VALUES(?,'a','capital_injection',?,?)", [id, id === 'future-cap' ? '2026-04-01' : '2026-03-15', JSON.stringify(metadata)]);
+  }
+  expect((await ports.businessAccounts('2026-01-01', '2026-12-31', { size: 25, after: null })).rows[0]).toMatchObject({ capital: 160.22, drawings: 10 });
+});
+
+test('numeric reverse and delete flags hide live documents', async () => {
+  const { db, repo, ports } = await setup();
+  await repo.postSourceJournal(
+    { id: 'inv-rev', bookId: 'a', type: 'invoice', date: '2026-03-01', locationId: 'shop-a', metadata: { total: 50, partyId: 'cust-a' } },
+    { id: 'inv-rev-j', bookId: 'a', periodId: 'a-p', date: '2026-03-01', memo: 'inv-rev', lines: [
+      { accountId: 'a:account:1100', partyId: 'cust-a', debit: 50, credit: 0 }, { accountId: 'a:account:4000', debit: 0, credit: 50 },
+    ] },
+  );
+  await repo.postSourceJournal(
+    { id: 'inv-del', bookId: 'a', type: 'invoice', date: '2026-03-01', locationId: 'shop-a', metadata: { total: 50, partyId: 'cust-a' } },
+    { id: 'inv-del-j', bookId: 'a', periodId: 'a-p', date: '2026-03-01', memo: 'inv-del', lines: [
+      { accountId: 'a:account:1100', partyId: 'cust-a', debit: 50, credit: 0 }, { accountId: 'a:account:4000', debit: 0, credit: 50 },
+    ] },
+  );
+  await db.run("UPDATE v2_sources SET metadata=json_set(metadata,'$.reversed',1) WHERE id='inv-rev'");
+  await db.run("UPDATE v2_sources SET metadata=json_set(metadata,'$.deleted','1') WHERE id='inv-del'");
+  const entries = await ports.entries('invoice', '2026-01-01', '2026-12-31', null, 'all', { size: 25, after: null });
+  expect(entries.rows.map(row => row.id)).toEqual(['inv-a']);
+  const unpaid = await ports.unpaidInvoices('cust-a', 'all', { size: 25, after: null });
+  expect(unpaid?.rows.map(row => row.id)).toEqual(['inv-a']);
+  expect(await ports.entry('invoice', 'inv-rev', 'all')).toMatchObject({ reversible: false, editable: false });
+});
+
+test('cash and statement continuation requires a non-empty date and id', async () => {
+  const { ports } = await setup();
+  const cash = await ports.cashMovements('2026-02-01', '2026-02-28', 'all', { size: 1, after: null });
+  const statement = await ports.partyStatement('cust-a', '2026-02-01', '2026-02-28', 'all', { size: 1, after: null });
+  for (const after of [{ id: cash.rows[0].id }, { id: cash.rows[0].id, date: '' }, { date: '2026-02-02' }] as Obj[]) {
+    await expect(ports.cashMovements('2026-02-01', '2026-02-28', 'all', { size: 1, after })).rejects.toThrow('INVALID_CURSOR');
+  }
+  for (const after of [{ id: statement!.rows[0].id }, { id: statement!.rows[0].id, date: '' }, { date: '2026-02-01' }] as Obj[]) {
+    await expect(ports.partyStatement('cust-a', '2026-02-01', '2026-02-28', 'all', { size: 1, after })).rejects.toThrow('INVALID_CURSOR');
+  }
+  const continued = await ports.partyStatement('cust-a', '2026-02-01', '2026-02-28', 'all', { size: 1, after: statement!.next });
+  expect(continued!.rows[0].id).not.toBe(statement!.rows[0].id);
+});

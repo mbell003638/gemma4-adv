@@ -922,6 +922,9 @@ describe('roadmap phases 7–8 sync UX contracts', () => {
     expect(admin).toContain('Create QR invitation');
     expect(admin).toContain('Invitation code behind the QR');
     expect(recovery).toContain('redeemSyncEnrollmentCode');
+    expect(recovery).toContain('epochResult.currentSequence >= epochResult.epochStartSequence');
+    expect(recovery).toContain('Install the validated server snapshot before sync resumes');
+    expect(recovery).not.toContain('UPDATE sync_profiles SET book_epoch=?,enabled=?,recovery_required=0,recovery_reason=NULL');
     expect(server).toContain('/v1/sync/enrollment-codes');
     expect(server).toContain('/v1/sync/enroll-code/redeem');
   });

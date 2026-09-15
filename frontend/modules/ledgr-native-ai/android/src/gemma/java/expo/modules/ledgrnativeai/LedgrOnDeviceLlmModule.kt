@@ -382,11 +382,14 @@ class LedgrOnDeviceLlmModule : Module() {
 
     AsyncFunction("gemmaDownload") { modelId: String, promise: Promise ->
       gemmaManagement(promise, "download:$modelId") {
+        checkWifiOrUnmetered()
         val stop = AtomicBoolean(false)
         if (gemmaDownloadStops.putIfAbsent(modelId, stop) != null) throw GemmaPackException("MODEL_DOWNLOAD_BUSY")
             try {
-              gemmaStore().download(modelId, { stop.get() }) { received, total, phase ->
-                sendEvent("downloadProgress", mapOf("modelId" to modelId, "received" to received, "total" to total, "phase" to phase))
+              withWakeLock("download-$modelId") {
+                gemmaStore().download(modelId, { stop.get() }) { received, total, phase ->
+                  sendEvent("downloadProgress", mapOf("modelId" to modelId, "received" to received, "total" to total, "phase" to phase))
+                }
               }
               "{\"modelId\":${org.json.JSONObject.quote(modelId)},\"state\":\"ready\"}"
             } finally {

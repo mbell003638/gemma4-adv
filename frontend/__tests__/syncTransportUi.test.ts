@@ -39,4 +39,17 @@ describe('sync settings offers all three transports', () => {
     expect(screen).toContain('parseWifiP2pQr');
     expect(screen).toMatch(/no internet/i);
   });
+
+  it('does not claim a nearby Wi-Fi book transfer succeeded', () => {
+    expect(screen).toContain('parseWifiP2pQr');
+    expect(screen).not.toContain('Synchronized successfully with nearby phone over Wi-Fi.');
+    expect(screen).toContain('Nearby Wi-Fi book transfer is not available yet. Pairing QR is not a completed sync.');
+  });
+
+  it('does not present a local Drive passphrase save as live Google sync', () => {
+    expect(screen).not.toContain('Connect Google Drive');
+    expect(screen).not.toContain('Save & Sync Google Drive');
+    expect(screen).toContain('Save passphrase locally');
+    expect(screen).toContain('Passphrase and Cloud Drive configuration saved locally. Google Drive transfer is not active until OAuth exists.');
+  });
 });

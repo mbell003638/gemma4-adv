@@ -31,7 +31,8 @@ export const GEMMA_CAPABILITIES: readonly GemmaCapability[] = ['text', 'tools', 
 export const GEMMA_RUNTIME = 'litert-lm';
 
 /** Hosts a pinned artifact may be fetched from. */
-const ALLOWED_HOSTS = ['huggingface.co', 'hf.co'];
+const ALLOWED_HOSTS = new Set(['huggingface.co', 'hf.co']);
+const ALLOWED_HOST_SUFFIX = '.hf.co';
 
 export type GemmaPack = {
   id: string;
@@ -88,18 +89,31 @@ function capabilities(value: unknown): GemmaCapability[] | null {
   return parsed;
 }
 
+/**
+ * Minimal https parser used instead of `new URL`, because React Native's URL
+ * is a partial polyfill whose `port`/`username` handling cannot be relied on
+ * for a security check. Backslashes are refused outright: several parsers
+ * treat `\` as `/`, so a string that disagrees with itself about where the
+ * host ends is never allowed to reach a downloader.
+ */
 function allowedUrl(raw: string, filename: string): boolean {
-  let url: URL;
-  try { url = new URL(raw); } catch { return false; }
-  if (url.protocol !== 'https:') return false;
-  if (url.username || url.password) return false;
-  if (url.port && url.port !== '443') return false;
-  const host = url.hostname.toLowerCase();
-  if (!ALLOWED_HOSTS.includes(host) && !host.endsWith('.hf.co')) return false;
+  if (!filename) return false;
+  if (raw.includes('\\') || /[\s"'<>]/.test(raw)) return false;
+  const match = /^https:\/\/([^/?#]+)([/?#][^\s]*)?$/i.exec(raw);
+  if (!match) return false;
+  const authority = match[1];
+  if (authority.includes('@')) return false;
+  const portSplit = /^([^:]+)(?::(\d+))?$/.exec(authority);
+  if (!portSplit) return false;
+  const host = portSplit[1].toLowerCase();
+  const port = portSplit[2];
+  if (port !== undefined && port !== '443') return false;
+  if (!ALLOWED_HOSTS.has(host) && !host.endsWith(ALLOWED_HOST_SUFFIX)) return false;
+  const rest = match[2] || '';
   // A signed-CDN query string is fine to follow at download time, but a
   // catalogue row carrying one is a sign the URL was captured, not pinned.
-  if (url.search || url.hash) return false;
-  return filename.length > 0;
+  if (rest.includes('?') || rest.includes('#')) return false;
+  return true;
 }
 
 /**
@@ -166,25 +180,27 @@ export function parseGemmaPackRow(row: unknown): GemmaPack | null {
 }
 
 /**
- * Parses a whole catalogue. Used for the bundled asset, a network response and
- * the cache alike -- cached JSON is not more trustworthy for having been
- * written by us once, so it goes through the same checks.
+ * Parses a whole catalogue, or throws CATALOG_SCHEMA_MISMATCH.
+ *
+ * The document fails as a unit. If one row is unusable, the remaining rows have
+ * no more standing than the broken one. Cached JSON is not more trustworthy
+ * for having been written by us once, so it goes through the same checks.
  */
 export function parseGemmaCatalog(raw: unknown): GemmaPack[] {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('CATALOG_SCHEMA_MISMATCH');
   const body = raw as Record<string, unknown>;
-  if (body.schema !== GEMMA_PACK_SCHEMA) return [];
-  if (!Array.isArray(body.packs)) return [];
+  if (body.schema !== GEMMA_PACK_SCHEMA) throw new Error('CATALOG_SCHEMA_MISMATCH');
+  if (!Array.isArray(body.packs) || body.packs.length === 0) throw new Error('CATALOG_SCHEMA_MISMATCH');
 
   const packs: GemmaPack[] = [];
   const ids = new Set<string>();
   const filenames = new Set<string>();
   for (const row of body.packs) {
     const pack = parseGemmaPackRow(row);
-    if (!pack) continue;
+    if (!pack) throw new Error('CATALOG_SCHEMA_MISMATCH');
     // Two rows claiming one id makes selection non-deterministic; two rows
     // sharing a filename makes them overwrite each other on disk.
-    if (ids.has(pack.id) || filenames.has(pack.filename)) continue;
+    if (ids.has(pack.id) || filenames.has(pack.filename)) throw new Error('CATALOG_SCHEMA_MISMATCH');
     ids.add(pack.id);
     filenames.add(pack.filename);
     packs.push(pack);

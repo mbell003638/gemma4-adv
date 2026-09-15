@@ -9,6 +9,7 @@ import type { AIConfig } from '@/src/db/ai';
 import { recognizeLocalOcr } from '@/src/utils/localOcr';
 import { interpretLocalDocumentText } from '@/src/accountingV2/localDocumentParser';
 import { extractDocumentWithGemma, transcribeAudioWithGemma } from '@/src/accountingV2/gemma/mediaTasks';
+import { gemmaPackStatus, hasReadyGemmaCapability } from '@/src/utils/gemmaNative';
 import { askBooksOnDevice } from '@/src/accountingV2/onDeviceAsk';
 import { runReadTool } from '@/src/accountingV2/onDeviceReadTools';
 import { adoptRemoteKey, getCloudConfig, getStorageClient, saveCloudConfig, type CloudDriveConfig } from '@/src/sync/cloudDriveProvider';
@@ -1876,7 +1877,7 @@ export const api = {
     if (mode === 'android-device') {
       const local = await runLocal();
       if (local.document) return local.document;
-      if (input.uri && input.mimeType) {
+      if (input.uri && input.mimeType && hasReadyGemmaCapability(await gemmaPackStatus(), 'vision')) {
         try {
           const extracted = await extractDocumentWithGemma({ uri: input.uri, mimeType: input.mimeType });
           return { ...extracted, __ledgrAnalysisMeta: { source: 'on-device-llm', notice: 'On-device Gemma prepared this draft because local OCR did not find enough ledger lines.' } };

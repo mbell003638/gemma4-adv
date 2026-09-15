@@ -16,7 +16,9 @@ describe('Gemma media bridge frames', () => {
   });
 
   it('requires both a verified native capability and a ready pack', () => {
-    const ready = { supported: true, bridgeVersion: 2, capabilities: ['text', 'audio'], packs: { 'gemma4-e2b': { state: 'ready', bytesOnDisk: 1, partialBytes: 0 } } };
+    const protocol2 = { supported: true, bridgeVersion: 2, capabilities: ['text', 'audio'], packs: { 'gemma4-e2b': { state: 'ready', bytesOnDisk: 1, partialBytes: 0 } } };
+    expect(hasReadyGemmaCapability(protocol2, 'audio')).toBe(false);
+    const ready = { ...protocol2, bridgeVersion: 3 };
     expect(hasReadyGemmaCapability(ready, 'audio')).toBe(true);
     expect(hasReadyGemmaCapability(ready, 'vision')).toBe(false);
     expect(hasReadyGemmaCapability({ ...ready, packs: {} }, 'audio')).toBe(false);

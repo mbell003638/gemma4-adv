@@ -4,7 +4,7 @@ import { toScope } from './branchPorts';
 import { liveBookContext } from './liveBookContext';
 import { cancelProposal, createProposalExecutor } from './proposalExecutor';
 import { ProposalStore } from './proposalStore';
-import { LIVE_GEMMA_PROPOSALS } from './liveProposalPolicy';
+import { LIVE_GEMMA_PROPOSALS, operationEnabled } from './liveProposalPolicy';
 
 function db() {
   const runner = activeSqlRunner();
@@ -62,7 +62,15 @@ function executorPorts(runner: ReturnType<typeof db>) {
       const date = String(normalized.date || scope.today);
       return Boolean(await runner.first("SELECT 1 ok FROM v2_periods WHERE book_id=? AND status='open' AND start_date<=? AND end_date>=? LIMIT 1", [scope.bookId, date, date]));
     },
-    canApply: async (operation: string, expected: Scope) => LIVE_GEMMA_PROPOSALS.has(operation) && sameScope(expected, await currentScope()),
+    canApply: async (operation: string, expected: Scope) => {
+      const current = await currentScope();
+      let features: string[] = [];
+      try {
+        const value: unknown = JSON.parse(current.featureEpoch);
+        features = Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+      } catch { features = []; }
+      return LIVE_GEMMA_PROPOSALS.has(operation) && sameScope(expected, current) && operationEnabled(operation, features);
+    },
     apply: async (operation: string, normalized: Obj, scope: Scope, tx: ReturnType<typeof db>) => {
       const { createTransactionActionPort } = await import('./transactionActionPort');
       return createTransactionActionPort()(operation, normalized, scope, tx);

@@ -1,5 +1,5 @@
 export type ConfirmationIntent = 'confirm' | 'cancel' | 'other';
-const confirmations = new Set(['yes', 'y', 'i confirm', 'confirm', 'apply', 'proceed', 'ok', 'okay', 'please apply', 'please record', 'please enter', 'please save']);
+const confirmations = new Set(['yes', 'i confirm', 'confirm', 'apply', 'please apply', 'please record', 'please enter', 'please save']);
 const cancellations = new Set(['no', 'n', 'cancel', 'stop', 'discard', 'never mind', 'nevermind']);
 export function confirmationIntent(value: string): ConfirmationIntent {
   const text = value.trim().toLowerCase().replace(/[.!]+$/, '').trim().replace(/\s+/g, ' ');

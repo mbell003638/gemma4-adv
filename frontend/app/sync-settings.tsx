@@ -32,7 +32,7 @@ export default function SyncSettingsScreen() {
   const [cloudEmail, setCloudEmail] = useState('');
   const [cloudPassphrase, setCloudPassphrase] = useState('');
   const [cloudAutoSync, setCloudAutoSync] = useState(true);
-  const [cloudConnected, setCloudConnected] = useState(false);
+  const [cloudConfigSaved, setCloudConfigSaved] = useState(false);
 
   // Wi-Fi P2P State
   const [wifiSession, setWifiSession] = useState<WifiP2pSession | null>(null);
@@ -82,7 +82,7 @@ export default function SyncSettingsScreen() {
         setCloudEmail(cloudCfg.accountEmail || '');
         setCloudPassphrase(cloudCfg.passphrase || '');
         setCloudAutoSync(cloudCfg.autoSyncEnabled ?? true);
-        setCloudConnected(!!cloudCfg.accountEmail);
+        setCloudConfigSaved(!!cloudCfg.accountEmail);
       } else {
         setCloudPassphrase(generateSyncPassphrase());
       }
@@ -159,8 +159,8 @@ export default function SyncSettingsScreen() {
         passphrase: cloudPassphrase,
         autoSyncEnabled: cloudAutoSync,
       });
-      setCloudConnected(true);
-      setMessage('Cloud Drive configuration saved. End-to-end encryption key derived successfully.');
+      setCloudConfigSaved(true);
+      setMessage('Passphrase and Cloud Drive configuration saved locally. Google Drive transfer is not active until OAuth exists.');
     } catch (error: any) {
       setMessage(error?.message || 'Could not save Cloud Drive configuration.');
     } finally {
@@ -229,24 +229,16 @@ export default function SyncSettingsScreen() {
     try {
       const parsed = parseWifiP2pQr(result.data);
       setWifiScanning(false);
-      setMessage(`Wi-Fi pairing session detected from ${parsed.hostIp}. Connecting...`);
+      setMessage(`Wi-Fi pairing session detected from ${parsed.hostIp}.`);
       Alert.alert(
         'Pair Device Over Wi-Fi',
-        `Connect to ${parsed.hostIp} to synchronize this business account?`,
+        `Pairing QR from ${parsed.hostIp} is valid. Nearby Wi-Fi book transfer is not available yet.`,
         [
           { text: 'Cancel', style: 'cancel', onPress: () => setWifiScanLocked(false) },
           {
             text: 'Synchronize',
-            onPress: async () => {
-              setBusy(true);
-              try {
-                setMessage('Synchronized successfully with nearby phone over Wi-Fi.');
-                await load();
-              } catch (e: any) {
-                setMessage(e?.message || 'Wi-Fi synchronization failed.');
-              } finally {
-                setBusy(false);
-              }
+            onPress: () => {
+              setMessage('Nearby Wi-Fi book transfer is not available yet. Pairing QR is not a completed sync.');
             },
           },
         ]
@@ -623,12 +615,12 @@ export default function SyncSettingsScreen() {
 
               <Pressable
                 accessibilityRole="button"
-                accessibilityLabel="Connect or Save Google Drive"
+                accessibilityLabel="Save passphrase locally"
                 disabled={busy || !cloudPassphrase.trim()}
                 onPress={handleSaveCloudConfig}
                 style={[styles.primary, (busy || !cloudPassphrase.trim()) && styles.disabled]}
               >
-                <Text style={styles.primaryText}>{busy ? 'Saving...' : cloudConnected ? 'Save & Sync Google Drive' : 'Connect Google Drive'}</Text>
+                <Text style={styles.primaryText}>{busy ? 'Saving...' : cloudConfigSaved ? 'Update saved configuration' : 'Save passphrase locally'}</Text>
               </Pressable>
 
               {/* api.adoptCloudSyncKey existed but nothing called it, so a second
